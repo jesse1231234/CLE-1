@@ -182,24 +182,56 @@ def default_difficulty():
     return {"difficulty_label":"intermediate","difficulty_score":0.5,"wpm_adjustment":1.0,"rationale":"default heuristics"}
 
 def azure_llm_difficulty(text: str, endpoint: str, deployment: str, api_key: str, max_chars: int) -> dict:
-    payload = {
-        "model": deployment,
-        "input": [
-            {"role":"system","content":"You return only JSON with keys: difficulty_label, difficulty_score (0..1), wpm_adjustment (0.6..1.2), rationale (<= 3 sentences)."},
-            {"role":"user","content": f"Assess the reading difficulty of the following text and return JSON only.\nTEXT:\n{text[:max_chars]}"}
-        ],
-        "response_format": {"type":"json_object"}
-    }
-    headers = {"api-key": api_key, "Content-Type":"application/json"}
-    url = endpoint.rstrip("/") + "/openai/responses?api-version=2024-10-01-preview"
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    import json, requests
+
+    headers = {"api-key": api_key, "Content-Type": "application/json"}
+    sys_msg = (
+        "Return only JSON with keys: difficulty_label, difficulty_score (0..1), "
+        "wpm_adjustment (0.6..1.2), rationale (<= 3 sentences)."
+    )
+    user_msg = f"Assess the reading difficulty and return JSON only.\nTEXT:\n{text[:max_chars]}"
+
+    is_cogsvc = "cognitiveservices.azure.com" in endpoint
+    api_version = "2024-10-01-preview"  # change here if your tenant requires a different version
+
+    if is_cogsvc:
+        # Cognitive Services endpoint REQUIRES deployment in the path + api-version
+        url = endpoint.rstrip("/") + f"/openai/deployments/{deployment}/responses?api-version={api_version}"
+        body = {
+            # for deployment-scoped path, model is implied by deployment; body may omit "model"
+            "input": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+    else:
+        # Classic Azure OpenAI v1 endpoint: /openai/v1/responses (no api-version), model in body
+        url = endpoint.rstrip("/") + "/openai/v1/responses"
+        body = {
+            "model": deployment,
+            "input": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+
+    r = requests.post(url, headers=headers, json=body, timeout=60)
     r.raise_for_status()
     j = r.json()
     try:
         raw = j["output"]["content"][0]["text"]
         return json.loads(raw)
     except Exception:
-        return default_difficulty()
+        # Minimal, safe fallback
+        return {
+            "difficulty_label": "intermediate",
+            "difficulty_score": 0.5,
+            "wpm_adjustment": 1.0,
+            "rationale": "default heuristics",
+        }
+
 
 def words_from_text(text: str) -> int:
     import re as _re
