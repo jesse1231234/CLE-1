@@ -192,7 +192,7 @@ def azure_llm_difficulty(text: str, endpoint: str, deployment: str, api_key: str
     user_msg = f"Assess the reading difficulty and return JSON only.\nTEXT:\n{text[:max_chars]}"
 
     is_cogsvc = "cognitiveservices.azure.com" in endpoint
-    api_version = "2024-10-01-preview"  # change here if your tenant requires a different version
+    api_version = "2024-12-01-preview"  # change here if your tenant requires a different version
 
     if is_cogsvc:
         # Cognitive Services endpoint REQUIRES deployment in the path + api-version
