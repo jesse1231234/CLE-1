@@ -80,7 +80,7 @@ use_llm = bool(get_secret("azure.use_llm", False))
 az_endpoint = (get_secret("azure.endpoint", "") or "").strip()
 az_key = (get_secret("azure.api_key", "") or "").strip()
 az_deployment = (get_secret("azure.deployment", "gpt-4o") or "").strip()
-az_api_version = (get_secret("azure.api_version", "2024-10-01-preview") or "").strip()
+az_api_version = (get_secret("azure.api_version", "2024-12-01-preview") or "").strip()
 az_max_chars = int(get_secret("azure.max_chars", 15000))
 
 # App defaults
