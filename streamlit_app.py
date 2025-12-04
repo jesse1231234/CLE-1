@@ -21,28 +21,29 @@ st.title("📚 Course Load Estimator — Secrets-driven (no manual keys)")
 # --------------------------
 # Load from secrets.toml
 # --------------------------
-def get_secret(path, default=None):
-    # path like "canvas.base_url"
-    parts = path.split(".")
+from collections.abc import Mapping
+import streamlit as st
+
+def get_secret(path: str, default=None):
     cur = st.secrets
-    for p in parts:
-        if isinstance(cur, dict) and p in cur:
+    for p in path.split("."):
+        if isinstance(cur, Mapping) and p in cur:
             cur = cur[p]
         else:
             return default
     return cur
 
-canvas_base = get_secret("canvas.base_url") or ""
-canvas_token = get_secret("canvas.token") or ""
+# Usage
+canvas_base  = get_secret("canvas.base_url")
+canvas_token = get_secret("canvas.token")
+use_llm      = bool(get_secret("azure.use_llm", False))
+az_endpoint  = get_secret("azure.endpoint", "")
+az_key       = get_secret("azure.api_key", "")
+az_deployment= get_secret("azure.deployment", "gpt-4o")
+max_chars    = int(get_secret("azure.max_chars", 15000))
+default_level= (get_secret("app.default_level", "Undergraduate") or "Undergraduate").strip()
+max_file_mb  = int(get_secret("app.max_file_mb", 50))
 
-use_llm = bool(get_secret("azure.use_llm", False))
-az_endpoint = get_secret("azure.endpoint", "")
-az_key = get_secret("azure.api_key", "")
-az_deployment = get_secret("azure.deployment", "gpt-4o")
-max_chars = int(get_secret("azure.max_chars", 15000))
-
-default_level = (get_secret("app.default_level", "Undergraduate") or "Undergraduate").strip()
-max_file_mb = int(get_secret("app.max_file_mb", 50))
 max_file_bytes = max_file_mb * 1024 * 1024
 
 # Hard fail if mandatory secrets are missing
