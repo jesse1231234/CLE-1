@@ -7,30 +7,34 @@
 # - Estimates reading time (UG/Grad base WPM) with optional Azure LLM difficulty
 # - Exports CSV/JSON
 #
-# Required secrets (Streamlit Cloud -> Settings -> Secrets), TOML:
+# Secrets schema (Streamlit → Settings → Secrets):
 # [canvas]
 # base_url = "https://YOURTENANT.instructure.com"
 # token    = "YOUR_CANVAS_ADMIN_TOKEN"
 #
 # [azure]
-# use_llm     = false            # set true to enable LLM difficulty
-# endpoint    = "https://YOUR-RESOURCE.cognitiveservices.azure.com"
+# use_llm     = false                      # set true to enable LLM difficulty
+# endpoint    = "https://<resource>.cognitiveservices.azure.com"
 # api_key     = "YOUR_KEY"
-# deployment  = "YOUR_DEPLOYMENT_NAME"
-# api_version = "2024-10-01-preview"
+# deployment  = "YOUR_DEPLOYMENT_NAME"     # must match deployed name exactly
+# api_version = "2024-12-01-preview"       # use what your portal shows
 # max_chars   = 15000
 #
 # [app]
-# default_level = "Undergraduate"   # or "Graduate"
-# max_file_mb   = 50
+# default_level = "Undergraduate"          # or "Graduate"
+# max_file_mb   = 50                       # download cap per file
+#
+# Requirements (pip):
+# streamlit>=1.39 requests>=2.32 beautifulsoup4>=4.12 lxml>=5.2
+# pdfminer.six>=20240706 python-docx>=1.1.2 python-pptx>=1.0.2 openai>=1.52.0
 
 import io
 import re
-import os
 import json
+from collections.abc import Mapping
+
 import requests
 import streamlit as st
-from collections.abc import Mapping
 from bs4 import BeautifulSoup
 
 # Optional parsers (graceful if not present)
@@ -48,6 +52,12 @@ try:
     from pptx import Presentation  # python-pptx
 except Exception:
     Presentation = None
+
+# Azure OpenAI SDK
+try:
+    from openai import AzureOpenAI
+except Exception:
+    AzureOpenAI = None  # handled below
 
 
 # --------------------------
@@ -94,10 +104,13 @@ if not canvas_base:
     missing.append("canvas.base_url")
 if not canvas_token:
     missing.append("canvas.token")
-if use_llm and (not az_endpoint or not az_key or not az_deployment):
-    missing.append("azure.endpoint/api_key/deployment (required when azure.use_llm=true)")
+if use_llm:
+    if AzureOpenAI is None:
+        missing.append("openai SDK not installed (add `openai>=1.52.0`)")
+    if not az_endpoint or not az_key or not az_deployment:
+        missing.append("azure.endpoint/api_key/deployment (required when azure.use_llm=true)")
 if missing:
-    st.error("Missing required secrets: " + ", ".join(missing))
+    st.error("Missing requirements/secrets: " + ", ".join(missing))
     st.stop()
 
 
@@ -118,21 +131,24 @@ with st.sidebar:
         st.write("**Azure Key**: (loaded)")
         if st.button("🔧 Test Azure LLM"):
             try:
-                d = None
-                d = None
-                d = None
                 sample = "This is a short passage to estimate reading difficulty."
+                _ = None
+                _ = None
                 d = None
                 d = None
+                # call test
                 d = None
-                d = None
-                d = None
-                d = None
-                d = None
-                d = None
-                d = None
-                d = None
-                d = None
+                client = AzureOpenAI(api_key=az_key, azure_endpoint=az_endpoint.rstrip("/"), api_version=az_api_version)
+                resp = client.responses.create(
+                    model=az_deployment,
+                    input=[
+                        {"role": "system", "content": "Return only JSON with keys: difficulty_label, difficulty_score (0..1), wpm_adjustment (0.6..1.2), rationale (<= 3 sentences)."},
+                        {"role": "user", "content": f"Assess difficulty and return JSON only.\nTEXT:\n{sample}"},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                raw = getattr(resp, "output_text", None) or resp.output[0].content[0].text  # type: ignore[attr-defined]
+                st.success(f"OK: {raw}")
             except Exception as e:
                 st.error(str(e))
 
@@ -297,16 +313,17 @@ def azure_llm_difficulty(
     api_version: str,
 ) -> dict:
     """
-    Supports both:
-    - Cognitive Services domain: /openai/deployments/{deployment}/responses?api-version=...
-    - Azure OpenAI v1:           /openai/v1/responses  (no api-version; model in body)
+    Uses the official AzureOpenAI SDK (Responses API) against a Cognitive Services endpoint.
+    Endpoint, api_version, and deployment must match the Deployments + Endpoint page.
     """
-    headers = {
-        "api-key": api_key,
-        "Content-Type": "application/json",
-        # Some CogSvc front doors also accept Ocp-Apim-Subscription-Key; harmless to include:
-        "Ocp-Apim-Subscription-Key": api_key,
-    }
+    if AzureOpenAI is None:
+        raise RuntimeError("openai SDK not installed (pip install openai>=1.52.0)")
+
+    client = AzureOpenAI(
+        api_key=api_key,
+        azure_endpoint=endpoint.rstrip("/"),
+        api_version=api_version,
+    )
 
     sys_msg = (
         "Return only JSON with keys: difficulty_label, difficulty_score (0..1), "
@@ -314,48 +331,26 @@ def azure_llm_difficulty(
     )
     user_msg = f"Assess the reading difficulty and return JSON only.\nTEXT:\n{text[:max_chars]}"
 
-    is_cogsvc = "cognitiveservices.azure.com" in (endpoint or "")
+    try:
+        resp = client.responses.create(
+            model=deployment,  # deployment name, not the base model
+            input=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+        )
 
-    if is_cogsvc:
-        # Cognitive Services: deployment in path + api-version
-        url = endpoint.rstrip("/") + f"/openai/deployments/{deployment}/responses"
-        params = {"api-version": api_version}
-        body = {
-            "input": [
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        r = requests.post(url, headers=headers, params=params, json=body, timeout=60)
-        if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code} — {r.text[:500]}")
-        j = r.json()
-        try:
-            raw = j["output"]["content"][0]["text"]
-            return json.loads(raw)
-        except Exception:
-            return default_difficulty()
-    else:
-        # Azure OpenAI v1
-        url = endpoint.rstrip("/") + "/openai/v1/responses"
-        body = {
-            "model": deployment,  # model in body for v1
-            "input": [
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        r = requests.post(url, headers=headers, json=body, timeout=60)
-        if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code} — {r.text[:500]}")
-        j = r.json()
-        try:
-            raw = j["output"]["content"][0]["text"]
-            return json.loads(raw)
-        except Exception:
-            return default_difficulty()
+        raw = getattr(resp, "output_text", None)
+        if not raw:
+            raw = resp.output[0].content[0].text  # type: ignore[attr-defined]
+        return json.loads(raw)
+
+    except Exception as e:
+        # Bubble up with context so you can see the problem in the UI
+        raise RuntimeError(
+            f"Azure Responses call failed (endpoint={endpoint}, deployment={deployment}, api_version={api_version}): {e}"
+        )
 
 
 def words_from_text(text: str) -> int:
