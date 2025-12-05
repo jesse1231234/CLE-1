@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Self-contained Streamlit app that:
-# - Reads ALL config from Streamlit Cloud "Secrets" (no manual entry in UI)
+# - Reads ALL config from Streamlit "Secrets" (no manual entry in UI)
 # - Connects directly to Canvas (admin token) to scan a course
 # - Extracts text from Pages/Assignments/Discussions and Files (PDF/DOCX/PPTX)
 # - Detects embedded videos and lets you enter manual durations (hh:mm:ss)
@@ -115,7 +115,7 @@ if missing:
 
 
 # --------------------------
-# Sidebar (read-only config + test button)
+# Sidebar (read-only config)
 # --------------------------
 with st.sidebar:
     st.header("Configuration (from Secrets)")
@@ -129,28 +129,6 @@ with st.sidebar:
         st.write(f"**Deployment**: {az_deployment}")
         st.write(f"**API Version**: {az_api_version}")
         st.write("**Azure Key**: (loaded)")
-        if st.button("🔧 Test Azure LLM"):
-            try:
-                sample = "This is a short passage to estimate reading difficulty."
-                _ = None
-                _ = None
-                d = None
-                d = None
-                # call test
-                d = None
-                client = AzureOpenAI(api_key=az_key, azure_endpoint=az_endpoint.rstrip("/"), api_version=az_api_version)
-                resp = client.responses.create(
-                    model=az_deployment,
-                    input=[
-                        {"role": "system", "content": "Return only JSON with keys: difficulty_label, difficulty_score (0..1), wpm_adjustment (0.6..1.2), rationale (<= 3 sentences)."},
-                        {"role": "user", "content": f"Assess difficulty and return JSON only.\nTEXT:\n{sample}"},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                raw = getattr(resp, "output_text", None) or resp.output[0].content[0].text  # type: ignore[attr-defined]
-                st.success(f"OK: {raw}")
-            except Exception as e:
-                st.error(str(e))
 
 
 # --------------------------
@@ -304,6 +282,18 @@ def default_difficulty():
     }
 
 
+# NEW: Robust Azure call using Chat Completions with fallback (no response_format)
+def _coerce_json(text: str) -> dict:
+    """Best-effort: pull first JSON object from a string."""
+    if not text:
+        return {}
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    try:
+        return json.loads(m.group(0)) if m else {}
+    except Exception:
+        return {}
+
+
 def azure_llm_difficulty(
     text: str,
     endpoint: str,
@@ -313,8 +303,10 @@ def azure_llm_difficulty(
     api_version: str,
 ) -> dict:
     """
-    Uses the official AzureOpenAI SDK (Responses API) against a Cognitive Services endpoint.
-    Endpoint, api_version, and deployment must match the Deployments + Endpoint page.
+    Robust Azure call:
+    1) Try Chat Completions with response_format={"type":"json_object"} (preferred)
+    2) If not supported, retry without response_format and coerce JSON from content
+    3) As a last resort, return a safe default
     """
     if AzureOpenAI is None:
         raise RuntimeError("openai SDK not installed (pip install openai>=1.52.0)")
@@ -326,31 +318,60 @@ def azure_llm_difficulty(
     )
 
     sys_msg = (
-        "Return only JSON with keys: difficulty_label, difficulty_score (0..1), "
-        "wpm_adjustment (0.6..1.2), rationale (<= 3 sentences)."
+        "You are a function that MUST return only JSON with keys: "
+        "difficulty_label, difficulty_score (0..1), wpm_adjustment (0.6..1.2), rationale."
     )
-    user_msg = f"Assess the reading difficulty and return JSON only.\nTEXT:\n{text[:max_chars]}"
+    user_msg = (
+        "Assess the reading difficulty of the following text and return ONLY a JSON object. "
+        'Example: {"difficulty_label":"intermediate","difficulty_score":0.5,"wpm_adjustment":1.0,"rationale":"..."}\n\n'
+        f"TEXT:\n{text[:max_chars]}"
+    )
 
+    # Attempt 1: JSON-mode
     try:
-        resp = client.responses.create(
-            model=deployment,  # deployment name, not the base model
-            input=[
+        cc = client.chat.completions.create(
+            model=deployment,  # deployment name
+            messages=[
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": user_msg},
             ],
+            temperature=0,
             response_format={"type": "json_object"},
         )
-
-        raw = getattr(resp, "output_text", None)
-        if not raw:
-            raw = resp.output[0].content[0].text  # type: ignore[attr-defined]
+        raw = cc.choices[0].message.content
         return json.loads(raw)
+    except Exception:
+        pass  # Not supported on this api_version/deployment → try without response_format
 
-    except Exception as e:
-        # Bubble up with context so you can see the problem in the UI
-        raise RuntimeError(
-            f"Azure Responses call failed (endpoint={endpoint}, deployment={deployment}, api_version={api_version}): {e}"
+    # Attempt 2: no response_format; enforce via prompt & coerce
+    try:
+        cc = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
         )
+        raw = cc.choices[0].message.content
+        data = _coerce_json(raw)
+        if not data:
+            raise ValueError("Model did not return JSON.")
+        # light validation/defaults
+        return {
+            "difficulty_label": data.get("difficulty_label", "intermediate"),
+            "difficulty_score": float(data.get("difficulty_score", 0.5)),
+            "wpm_adjustment": float(data.get("wpm_adjustment", 1.0)),
+            "rationale": data.get("rationale", "fallback parse"),
+        }
+    except Exception as e:
+        # Fallback default (safe)
+        return {
+            "difficulty_label": "intermediate",
+            "difficulty_score": 0.5,
+            "wpm_adjustment": 1.0,
+            "rationale": f"default heuristics (LLM unavailable: {e})",
+        }
 
 
 def words_from_text(text: str) -> int:
