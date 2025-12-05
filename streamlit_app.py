@@ -1,428 +1,99 @@
-# streamlit_app.py
-# Self-contained Streamlit app that:
-# - Reads ALL config from Streamlit "Secrets" (no manual entry in UI)
-# - Connects directly to Canvas (admin token) to scan a course
-# - Extracts text from Pages/Assignments/Discussions and Files (PDF/DOCX/PPTX)
-# - Detects embedded videos and lets you enter manual durations (hh:mm:ss)
-# - Estimates reading time (UG/Grad base WPM) with optional Azure LLM difficulty
-# - Exports CSV/JSON
-#
-# Secrets schema (Streamlit → Settings → Secrets):
-# [canvas]
-# base_url = "https://YOURTENANT.instructure.com"
-# token    = "YOUR_CANVAS_ADMIN_TOKEN"
-#
-# [azure]
-# use_llm     = false                      # set true to enable LLM difficulty
-# endpoint    = "https://<resource>.cognitiveservices.azure.com"
-# api_key     = "YOUR_KEY"
-# deployment  = "YOUR_DEPLOYMENT_NAME"     # must match deployed name exactly
-# api_version = "2024-12-01-preview"       # use what your portal shows
-# max_chars   = 15000
-#
-# [app]
-# default_level = "Undergraduate"          # or "Graduate"
-# max_file_mb   = 50                       # download cap per file
-#
-# Requirements (pip):
-# streamlit>=1.39 requests>=2.32 beautifulsoup4>=4.12 lxml>=5.2
-# pdfminer.six>=20240706 python-docx>=1.1.2 python-pptx>=1.0.2 openai>=1.52.0
-
 import io
-import re
 import json
-from collections.abc import Mapping
+import math
+import os
+import re
+from typing import Dict, List, Tuple
 
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# Optional parsers (graceful if not present)
 try:
-    from pdfminer.high_level import extract_text as pdf_extract_text  # pdfminer.six
+    from pdfminer.high_level import extract_text as pdf_extract_text
 except Exception:
     pdf_extract_text = None
 
 try:
-    import docx  # python-docx
+    from docx import Document
 except Exception:
-    docx = None
+    Document = None
 
 try:
-    from pptx import Presentation  # python-pptx
+    from pptx import Presentation
 except Exception:
     Presentation = None
 
-# Azure OpenAI SDK
 try:
     from openai import AzureOpenAI
 except Exception:
-    AzureOpenAI = None  # handled below
+    AzureOpenAI = None
 
 
-# --------------------------
-# App setup
-# --------------------------
-st.set_page_config(page_title="Course Load Estimator (Secrets)", page_icon="📚", layout="wide")
-st.title("📚 Course Load Estimator — Secrets-driven (no manual keys)")
+# -------------------------------------------------------------------
+# Config & helpers
+# -------------------------------------------------------------------
 
 
-# --------------------------
-# Secrets helpers & load
-# --------------------------
-def get_secret(path: str, default=None):
-    """Path like 'canvas.base_url'. Works with Streamlit's Mapping-like secrets."""
-    cur: Mapping | dict = st.secrets
-    for p in path.split("."):
-        if isinstance(cur, Mapping) and p in cur:
-            cur = cur[p]
-        else:
-            return default
-    return cur
+def get_secret(name: str, default=None):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
 
 
-# Canvas (required)
-canvas_base = (get_secret("canvas.base_url") or "").strip()
-canvas_token = (get_secret("canvas.token") or "").strip()
+CANVAS_BASE = get_secret("CANVAS_BASE_URL", "").rstrip("/")
+CANVAS_TOKEN = get_secret("CANVAS_API_TOKEN", "")
 
-# Azure (optional for LLM difficulty)
-use_llm = bool(get_secret("azure.use_llm", False))
-az_endpoint = (get_secret("azure.endpoint", "") or "").strip()
-az_key = (get_secret("azure.api_key", "") or "").strip()
-az_deployment = (get_secret("azure.deployment", "gpt-4o") or "").strip()
-az_api_version = (get_secret("azure.api_version", "2024-12-01-preview") or "").strip()
-az_max_chars = int(get_secret("azure.max_chars", 15000))
+AZ_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT", "")
+AZ_API_KEY = get_secret("AZURE_OPENAI_API_KEY", "")
+AZ_MODEL = get_secret("AZURE_OPENAI_MODEL", "")
+AZ_API_VERSION = get_secret("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
-# App defaults
-default_level = (get_secret("app.default_level", "Undergraduate") or "Undergraduate").strip()
-max_file_mb = int(get_secret("app.max_file_mb", 50))
-MAX_FILE_BYTES = max_file_mb * 1024 * 1024
-
-# Validate required secrets
-missing = []
-if not canvas_base:
-    missing.append("canvas.base_url")
-if not canvas_token:
-    missing.append("canvas.token")
-if use_llm:
-    if AzureOpenAI is None:
-        missing.append("openai SDK not installed (add `openai>=1.52.0`)")
-    if not az_endpoint or not az_key or not az_deployment:
-        missing.append("azure.endpoint/api_key/deployment (required when azure.use_llm=true)")
-if missing:
-    st.error("Missing requirements/secrets: " + ", ".join(missing))
-    st.stop()
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
+AZ_MAX_CHARS = 15000  # truncate long docs for LLM
 
 
-# --------------------------
-# Sidebar (read-only config)
-# --------------------------
-with st.sidebar:
-    st.header("Configuration (from Secrets)")
-    st.write(f"**Canvas Base URL**: {canvas_base}")
-    st.write("**Canvas Token**: (loaded)")
-    st.write(f"**Default Level**: {default_level}")
-    st.write(f"**Max File Size**: {max_file_mb} MB")
-    st.write(f"**LLM Difficulty**: {'Enabled' if use_llm else 'Disabled'}")
-    if use_llm:
-        st.write(f"**Azure Endpoint**: {az_endpoint}")
-        st.write(f"**Deployment**: {az_deployment}")
-        st.write(f"**API Version**: {az_api_version}")
-        st.write("**Azure Key**: (loaded)")
+def canvas_headers():
+    if not CANVAS_TOKEN:
+        raise RuntimeError("Missing CANVAS_API_TOKEN in secrets/env.")
+    return {"Authorization": f"Bearer {CANVAS_TOKEN}"}
 
 
-# --------------------------
-# Canvas helpers
-# --------------------------
-def headers():
-    return {"Authorization": f"Bearer {canvas_token}"} if canvas_token else {}
-
-
-def paginate(url: str):
-    """Yield JSON pages following Canvas RFC5988 Link headers."""
-    s = requests.Session()
-    s.headers.update(headers())
+def canvas_get(url: str, params=None) -> List[dict]:
+    """Handle Canvas pagination."""
+    out = []
     while url:
-        r = s.get(url, timeout=30)
+        r = requests.get(url, headers=canvas_headers(), params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        yield data
-        nxt = None
-        link = r.headers.get("link") or r.headers.get("Link")
-        if link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    nxt = part[part.find("<") + 1 : part.find(">")]
-        url = nxt
-
-
-def list_modules_with_items(course_id: int):
-    url = f"{canvas_base.rstrip('/')}/api/v1/courses/{course_id}/modules?include[]=items&include[]=content_details&per_page=100"
-    for page in paginate(url):
-        for m in page:
-            yield m
-
-
-def get_page_body(course_id: int, url_or_id: str) -> str:
-    url = f"{canvas_base.rstrip('/')}/api/v1/courses/{course_id}/pages/{url_or_id}"
-    r = requests.get(url, headers=headers(), timeout=30)
-    r.raise_for_status()
-    return r.json().get("body", "") or ""
-
-
-def get_assignment(course_id: int, assignment_id: int) -> dict:
-    url = f"{canvas_base.rstrip('/')}/api/v1/courses/{course_id}/assignments/{assignment_id}"
-    r = requests.get(url, headers=headers(), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def get_discussion(course_id: int, topic_id: int) -> dict:
-    url = f"{canvas_base.rstrip('/')}/api/v1/courses/{course_id}/discussion_topics/{topic_id}"
-    r = requests.get(url, headers=headers(), timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def strip_html_to_text(html: str):
-    soup = BeautifulSoup(html or "", "lxml")
-    return soup.get_text(separator=" ", strip=True)
-
-
-VIDEO_DOMAINS = (
-    "youtube.com",
-    "youtu.be",
-    "vimeo.com",
-    "echo360",
-    "kaltura",
-    "panopto",
-    "video.",
-    "player.",
-)
-
-
-def detect_videos_from_html(html: str):
-    out = []
-    soup = BeautifulSoup(html or "", "lxml")
-    for iframe in soup.find_all("iframe"):
-        src = iframe.get("src") or ""
-        title = iframe.get("title") or ""
-        if any(dom in src for dom in VIDEO_DOMAINS):
-            out.append({"kind": "iframe", "src": src, "title": title or "Embedded Video"})
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        text = a.get_text(strip=True) or ""
-        if any(dom in href for dom in VIDEO_DOMAINS):
-            out.append({"kind": "link", "src": href, "title": text or "Video Link"})
+        if isinstance(data, list):
+            out.extend(data)
+        else:
+            out.append(data)
+        link = r.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                m = re.search(r"<([^>]+)>", part)
+                if m:
+                    next_url = m.group(1)
+        url = next_url
+        params = None
     return out
 
 
-def hhmmss_to_seconds(hhmmss: str) -> int:
-    m = re.match(r"^(\d{1,2}):([0-5]\d):([0-5]\d)$", (hhmmss or "").strip())
-    if not m:
-        return 0
-    h, m_, s = map(int, m.groups())
-    return h * 3600 + m_ * 60 + s
+# -------------------------------------------------------------------
+# Canvas API helpers
+# -------------------------------------------------------------------
 
 
-def extract_file_text(file_url: str, content_type: str, max_bytes: int) -> tuple[str, int]:
-    """Download file and return (text, page_count_est). Pages only for PPTX when possible."""
-    r = requests.get(file_url, headers=headers(), timeout=60, stream=True)
-    r.raise_for_status()
-    total, chunks = 0, []
-    for chunk in r.iter_content(1024 * 64):
-        total += len(chunk)
-        if total > max_bytes:
-            return ("", 0)  # size cap
-        chunks.append(chunk)
-    data = b"".join(chunks)
-    # PDF
-    if "pdf" in (content_type or "").lower() and pdf_extract_text:
-        try:
-            text = pdf_extract_text(io.BytesIO(data)) or ""
-            return (text, 0)
-        except Exception:
-            pass
-    # DOCX
-    if (("word" in (content_type or "").lower()) or ("docx" in (content_type or "").lower())) and docx:
-        try:
-            d = docx.Document(io.BytesIO(data))
-            text = "\n".join(p.text for p in d.paragraphs)
-            return (text, 0)
-        except Exception:
-            pass
-    # PPTX
-    if (("powerpoint" in (content_type or "").lower()) or ("pptx" in (content_type or "").lower())) and Presentation:
-        try:
-            prs = Presentation(io.BytesIO(data))
-            parts = []
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        parts.append(shape.text)
-            return ("\n".join(parts), len(prs.slides))
-        except Exception:
-            pass
-    # Fallback to best-effort text
-    try:
-        return (data.decode("utf-8", errors="ignore"), 0)
-    except Exception:
-        return ("", 0)
-
-
-# --------------------------
-# Estimation helpers
-# --------------------------
-def default_difficulty():
-    return {
-        "difficulty_label": "intermediate",
-        "difficulty_score": 0.5,
-        "wpm_adjustment": 1.0,
-        "rationale": "default heuristics",
-    }
-
-
-# NEW: Robust Azure call using Chat Completions with fallback (no response_format)
-def _coerce_json(text: str) -> dict:
-    """Best-effort: pull first JSON object from a string."""
-    if not text:
-        return {}
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    try:
-        return json.loads(m.group(0)) if m else {}
-    except Exception:
-        return {}
-
-
-def azure_llm_difficulty(
-    text: str,
-    endpoint: str,
-    deployment: str,
-    api_key: str,
-    max_chars: int,
-    api_version: str,
-) -> dict:
-    """
-    Robust Azure call:
-    1) Try Chat Completions with response_format={"type":"json_object"} (preferred)
-    2) If not supported, retry without response_format and coerce JSON from content
-    3) As a last resort, return a safe default
-    """
-    if AzureOpenAI is None:
-        raise RuntimeError("openai SDK not installed (pip install openai>=1.52.0)")
-
-    client = AzureOpenAI(
-        api_key=api_key,
-        azure_endpoint=endpoint.rstrip("/"),
-        api_version=api_version,
-    )
-
-    sys_msg = (
-        "You are a function that MUST return only JSON with keys: "
-        "difficulty_label, difficulty_score (0..1), wpm_adjustment (0.6..1.2), rationale."
-    )
-    user_msg = (
-        "Assess the reading difficulty of the following text and return ONLY a JSON object. "
-        'Example: {"difficulty_label":"intermediate","difficulty_score":0.5,"wpm_adjustment":1.0,"rationale":"..."}\n\n'
-        f"TEXT:\n{text[:max_chars]}"
-    )
-
-    # Attempt 1: JSON-mode
-    try:
-        cc = client.chat.completions.create(
-            model=deployment,  # deployment name
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        raw = cc.choices[0].message.content
-        return json.loads(raw)
-    except Exception:
-        pass  # Not supported on this api_version/deployment → try without response_format
-
-    # Attempt 2: no response_format; enforce via prompt & coerce
-    try:
-        cc = client.chat.completions.create(
-            model=deployment,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0,
-        )
-        raw = cc.choices[0].message.content
-        data = _coerce_json(raw)
-        if not data:
-            raise ValueError("Model did not return JSON.")
-        # light validation/defaults
-        return {
-            "difficulty_label": data.get("difficulty_label", "intermediate"),
-            "difficulty_score": float(data.get("difficulty_score", 0.5)),
-            "wpm_adjustment": float(data.get("wpm_adjustment", 1.0)),
-            "rationale": data.get("rationale", "fallback parse"),
-        }
-    except Exception as e:
-        # Fallback default (safe)
-        return {
-            "difficulty_label": "intermediate",
-            "difficulty_score": 0.5,
-            "wpm_adjustment": 1.0,
-            "rationale": f"default heuristics (LLM unavailable: {e})",
-        }
-
-
-def words_from_text(text: str) -> int:
-    toks = re.findall(r"\b\w+\b", text or "", flags=re.UNICODE)
-    return len(toks)
-
-
-def reading_minutes(words: int, base_wpm: int, diff: dict) -> float:
-    wpm_adj = max(0.1, float(diff.get("wpm_adjustment", 1.0)))
-    adjusted = max(50, base_wpm * wpm_adj)
-    score = float(diff.get("difficulty_score", 0.5))
-    reread = 1.0 + (0.15 * score)  # up to +15% at score=1.0
-    return (words / adjusted) * reread
-
-
-def estimate_quiz_time(quiz: dict) -> float:
-    # minutes
-    tl = quiz.get("time_limit") if quiz else None
-    if tl:
-        return float(tl)
-    qc = (quiz or {}).get("question_count") or 0
-    return qc * 2.0 if qc else 10.0
-
-
-# --------------------------
-# UI: Level & Course controls
-# --------------------------
-level = st.selectbox(
-    "Learner Level",
-    ["Undergraduate", "Graduate"],
-    index=(0 if default_level.lower().startswith("under") else 1),
-)
-base_wpm = 225 if level == "Undergraduate" else 250
-
-st.header("1) Scan a Course")
-course_id = st.number_input("Canvas Course ID", min_value=1, step=1, value=12345)
-
-if st.button("🚀 Scan (Modules & Items)"):
-    progress = st.progress(0.0, text="Listing modules…")
+def get_modules_with_items(course_id: int) -> List[dict]:
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/modules"
+    mods = canvas_get(url, params={"include[]": "items", "per_page": 100})
     items = []
-    try:
-        modules = list(list_modules_with_items(int(course_id)))
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-    total_items = sum(len(m.get("items", [])) for m in modules)
-    done = 0
-    for mod in modules:
-        for it in (mod.get("items") or []):
-            done += 1
-            progress.progress(min(0.99, done / max(1, total_items)), text=f"Fetching item {done}/{total_items}")
+    for mod in mods:
+        for it in mod.get("items", []):
             items.append(
                 {
                     "module_name": mod.get("name", ""),
@@ -433,234 +104,748 @@ if st.button("🚀 Scan (Modules & Items)"):
                     "content_id": it.get("content_id"),
                     "page_url": it.get("page_url"),
                     "content_details": it.get("content_details", {}),
+                    "item_key": f"{it.get('type','')}::{it.get('id')}",
                 }
             )
-    st.success(f"Collected {len(items)} items from {len(modules)} modules.")
-    st.session_state["items"] = items
+    return items
 
 
-# --------------------------
-# Process items
-# --------------------------
-st.header("2) Extract & Estimate")
-left, right = st.columns([3, 2])
-
-with left:
-    if st.button("🔎 Process Items"):
-        if "items" not in st.session_state:
-            st.warning("Scan the course first.")
-            st.stop()
-
-        results = []
-        pending_videos = {}
-
-        for it in st.session_state["items"]:
-            item_type, title, html_url = it["item_type"], it["title"], it["html_url"]
-            read_min = watch_min = do_min = 0.0
-            difficulty = default_difficulty()
-
-            if item_type in ("Page", "Assignment", "Discussion"):
-                # Fetch and parse HTML
-                try:
-                    if item_type == "Page":
-                        body = get_page_body(int(course_id), it.get("page_url"))
-                    elif item_type == "Assignment":
-                        a = get_assignment(int(course_id), it.get("content_id"))
-                        body = a.get("description", "") or ""
-                    else:
-                        d = get_discussion(int(course_id), it.get("content_id"))
-                        body = d.get("message", "") or ""
-                except Exception:
-                    body = ""
-
-                text = strip_html_to_text(body)
-                # Detect videos
-                vids = detect_videos_from_html(body)
-                for idx, v in enumerate(vids, start=1):
-                    key = f"{html_url}::{v.get('src','')}::{idx}"
-                    pending_videos[key] = {
-                        "title": v.get("title", "Video"),
-                        "src": v.get("src", ""),
-                        "hhmmss": "00:00:00",
-                    }
-
-                words = words_from_text(text)
-                if words > 0:
-                    if use_llm:
-                        try:
-                            difficulty = azure_llm_difficulty(
-                                text, az_endpoint, az_deployment, az_key, az_max_chars, az_api_version
-                            )
-                        except Exception as e:
-                            st.warning(f"LLM difficulty failed for '{title}': {e}")
-                            difficulty = default_difficulty()
-                    read_min = reading_minutes(words, base_wpm, difficulty)
-
-            elif item_type == "File":
-                cd = it.get("content_details") or {}
-                file_url, content_type = cd.get("url"), cd.get("content_type", "")
-                if file_url:
-                    text, pages = extract_file_text(file_url, content_type, MAX_FILE_BYTES)
-                    words = words_from_text(text)
-                    if words > 0:
-                        if use_llm:
-                            try:
-                                difficulty = azure_llm_difficulty(
-                                    text, az_endpoint, az_deployment, az_key, az_max_chars, az_api_version
-                                )
-                            except Exception as e:
-                                st.warning(f"LLM difficulty failed for file '{title}': {e}")
-                                difficulty = default_difficulty()
-                        read_min = reading_minutes(words, base_wpm, difficulty)
-                    else:
-                        # page-based fallback (slides vs scans)
-                        mp = 2.0 if "presentation" in (content_type or "").lower() else 3.5
-                        read_min = pages * mp
-
-            elif item_type == "Quiz":
-                q = it.get("content_details") or {}
-                do_min = estimate_quiz_time(q)
-
-            else:
-                # External URL/Tool: check if looks like a video link
-                if any(dom in (html_url or "") for dom in ("youtube", "vimeo", "echo360", "panopto", "kaltura")):
-                    key = f"{html_url}::external"
-                    pending_videos[key] = {
-                        "title": title or "External Video",
-                        "src": html_url,
-                        "hhmmss": "00:00:00",
-                    }
-
-            total = read_min + watch_min + do_min
-            results.append(
-                {
-                    "module": it["module_name"],
-                    "title": title,
-                    "type": item_type,
-                    "url": html_url,
-                    "read_min": round(read_min, 2),
-                    "watch_min": round(watch_min, 2),
-                    "do_min": round(do_min, 2),
-                    "total_min": round(total, 2),
-                    "difficulty": difficulty,
-                }
-            )
-
-        st.session_state["results"] = results
-        st.session_state["pending_videos"] = pending_videos
-        st.success(f"Processed {len(results)} items. Videos needing duration: {len(pending_videos)}")
-
-with right:
-    if "results" in st.session_state:
-        res = st.session_state["results"]
-        total_read = sum(r["read_min"] for r in res)
-        total_watch = sum(r["watch_min"] for r in res)
-        total_do = sum(r["do_min"] for r in res)
-        st.metric("Total Read (min)", f"{total_read:.1f}")
-        st.metric("Total Watch (min)", f"{total_watch:.1f}")
-        st.metric("Total Do (min)", f"{total_do:.1f}")
-        st.metric("Total (hrs)", f"{(total_read + total_watch + total_do) / 60:.2f}")
+def get_page_body(course_id: int, page_url: str) -> str:
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/pages/{page_url}"
+    r = requests.get(url, headers=canvas_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json().get("body", "") or ""
 
 
-# --------------------------
-# Manual video durations
-# --------------------------
-st.header("3) Enter Video Durations (hh:mm:ss)")
-pending = st.session_state.get("pending_videos", {})
-if pending:
-    for key, meta in list(pending.items()):
-        with st.expander(f"{meta['title']} — {meta.get('src','')}"):
-            hhmmss = st.text_input("Duration (hh:mm:ss)", key=f"dur_{key}", value=meta.get("hhmmss", "00:00:00"))
-            if st.button("💾 Save", key=f"save_{key}"):
-                sec = hhmmss_to_seconds(hhmmss)
-                if sec <= 0:
-                    st.error("Invalid hh:mm:ss (must be > 00:00:00).")
-                else:
-                    # apply to results with matching URL
-                    for r in st.session_state["results"]:
-                        if r["url"] and r["url"] in key:
-                            r["watch_min"] = round(sec / 60.0, 2)
-                            r["total_min"] = round(r["read_min"] + r["watch_min"] + r["do_min"], 2)
-                    meta["hhmmss"] = hhmmss
-                    st.success("Saved. This session will reuse the value.")
-else:
-    st.info("No pending videos detected yet.")
+def get_assignment(course_id: int, assignment_id: int) -> dict:
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/assignments/{assignment_id}"
+    r = requests.get(url, headers=canvas_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 
-# --------------------------
-# Rollups & Export
-# --------------------------
-st.header("4) Module Rollups & Export")
-if "results" in st.session_state and st.session_state["results"]:
-    # Module totals
-    rollups = {}
-    for r in st.session_state["results"]:
-        m = r["module"] or "(no module)"
-        grp = rollups.setdefault(m, {"read": 0.0, "watch": 0.0, "do": 0.0, "total": 0.0})
-        grp["read"] += r["read_min"]
-        grp["watch"] += r["watch_min"]
-        grp["do"] += r["do_min"]
-        grp["total"] += r["total_min"]
+def get_discussion(course_id: int, topic_id: int) -> dict:
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/discussion_topics/{topic_id}"
+    r = requests.get(url, headers=canvas_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    st.subheader("Module Totals (minutes)")
-    st.dataframe(
-        [{"module": m, **{k: round(v, 2) for k, v in vals.items()}} for m, vals in rollups.items()],
-        use_container_width=True,
+
+def get_quiz(course_id: int, quiz_id: int) -> dict:
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/quizzes/{quiz_id}"
+    r = requests.get(url, headers=canvas_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+# -------------------------------------------------------------------
+# Text / file handling
+# -------------------------------------------------------------------
+
+
+def strip_html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = soup.get_text(separator=" ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def words_from_text(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"\b\w+\b", text))
+
+
+def detect_videos_from_html(html: str) -> List[dict]:
+    """Find embedded videos via iframe/video tags and known hosts."""
+    videos = []
+    if not html:
+        return videos
+    soup = BeautifulSoup(html, "html.parser")
+
+    # iframe / video tags
+    for tag in soup.find_all(["iframe", "video", "embed"]):
+        src = tag.get("src") or tag.get("data-src") or ""
+        if not src:
+            continue
+        title = tag.get("title") or tag.get("aria-label") or "Embedded Video"
+        videos.append({"src": src, "title": title})
+
+    # Hyperlinks to common video hosts
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(dom in href for dom in ["youtube.com", "youtu.be", "vimeo.com", "echo360", "panopto", "kaltura"]):
+            title = a.get_text(strip=True) or "Linked Video"
+            videos.append({"src": href, "title": title})
+
+    return videos
+
+
+def extract_file_text(file_url: str, content_type: str, max_bytes: int) -> Tuple[str, int]:
+    """
+    Download a Canvas file and extract text + page/slide count.
+    Returns (text, pages).
+
+    PPTX is treated differently: we return "", slide_count so that
+    a slide-based heuristic is used instead of full-text reading.
+    """
+    if not file_url:
+        return "", 0
+
+    r = requests.get(file_url, headers=canvas_headers(), stream=True, timeout=60)
+    r.raise_for_status()
+    data = r.content[:max_bytes]
+
+    pages = 0
+    # PDF
+    if "pdf" in (content_type or "").lower() and pdf_extract_text:
+        try:
+            text = pdf_extract_text(io.BytesIO(data))
+            pages = text.count("\f") or 0
+            return text, pages
+        except Exception:
+            pass
+
+    # DOCX
+    if ("word" in (content_type or "").lower() or "docx" in (content_type or "").lower()) and Document:
+        try:
+            doc = Document(io.BytesIO(data))
+            text = "\n".join(p.text for p in doc.paragraphs)
+            return text, 0
+        except Exception:
+            pass
+
+    # PPTX
+    if (("powerpoint" in (content_type or "").lower()) or ("pptx" in (content_type or "").lower())) and Presentation:
+        try:
+            prs = Presentation(io.BytesIO(data))
+            slide_count = len(prs.slides)
+            # INTENTIONALLY return no text so slide-based heuristic is used.
+            return "", slide_count
+        except Exception:
+            pass
+
+    # Fallback: treat as plain text
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    return text, 0
+
+
+# -------------------------------------------------------------------
+# Difficulty & reading time
+# -------------------------------------------------------------------
+
+
+def default_difficulty() -> Dict:
+    return {
+        "label": "average",
+        "wpm_factor": 1.0,
+        "notes": "default difficulty (no LLM)",
+    }
+
+
+def reading_minutes(words: int, base_wpm: int, difficulty: Dict) -> float:
+    factor = float(difficulty.get("wpm_factor", 1.0) or 1.0)
+    wpm = max(80.0, base_wpm * factor)
+    return words / wpm
+
+
+def _coerce_json(raw: str):
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Try to extract JSON object
+    m = re.search(r"{.*}", raw, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def azure_llm_client(endpoint: str, api_key: str, api_version: str):
+    if AzureOpenAI is None:
+        raise RuntimeError("openai SDK not installed. pip install openai>=1.52.0")
+    return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint.rstrip("/"), api_version=api_version)
+
+
+def azure_llm_difficulty(
+    text: str,
+    endpoint: str,
+    model: str,
+    api_key: str,
+    max_chars: int,
+    api_version: str,
+) -> Dict:
+    """
+    Ask Azure OpenAI to estimate reading difficulty and wpm factor.
+    Returns dict with keys: label, wpm_factor, notes.
+    """
+    client = azure_llm_client(endpoint, api_key, api_version)
+
+    sys_msg = (
+        "You are a reading difficulty estimator. "
+        "Return ONLY a JSON object with keys:\n"
+        "  label: one of ['very_easy','easy','average','hard','very_hard']\n"
+        "  wpm_factor: a float multiplier relative to base reading speed\n"
+        "  notes: short explanation.\n"
+        "Very easy => 1.3, easy => 1.15, average => 1.0, hard => 0.8, very_hard => 0.65."
     )
 
-    # Exports
-    import csv
-    from io import StringIO
+    user_msg = (
+        "Estimate reading difficulty for the following course material "
+        "for a typical college student.\n\n"
+        f"TEXT:\n{text[:max_chars]}"
+    )
 
-    def to_csv(rows):
-        cols = [
-            "module",
-            "title",
-            "type",
-            "url",
-            "read_min",
-            "watch_min",
-            "do_min",
-            "total_min",
-            "difficulty_label",
-            "difficulty_score",
-            "wpm_adjustment",
-            "level",
-        ]
-        sio = StringIO()
-        w = csv.writer(sio)
-        w.writerow(cols)
-        for r in rows:
-            d = r.get("difficulty", {}) or {}
-            w.writerow(
-                [
-                    r["module"],
-                    r["title"],
-                    r["type"],
-                    r["url"],
-                    r["read_min"],
-                    r["watch_min"],
-                    r["do_min"],
-                    r["total_min"],
-                    d.get("difficulty_label", ""),
-                    d.get("difficulty_score", ""),
-                    d.get("wpm_adjustment", ""),
-                    level,
-                ]
-            )
-        return sio.getvalue().encode("utf-8")
+    # First attempt: JSON mode
+    try:
+        cc = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = cc.choices[0].message.content
+        data = json.loads(raw)
+        return {
+            "label": data.get("label", "average"),
+            "wpm_factor": float(data.get("wpm_factor", 1.0)),
+            "notes": data.get("notes", ""),
+        }
+    except Exception:
+        pass
 
-    def to_json(rows):
-        return json.dumps({"level": level, "items": rows}, indent=2).encode("utf-8")
+    # Fallback: best-effort JSON
+    try:
+        cc = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+        )
+        raw = cc.choices[0].message.content
+        data = _coerce_json(raw) or {}
+        return {
+            "label": data.get("label", "average"),
+            "wpm_factor": float(data.get("wpm_factor", 1.0)),
+            "notes": data.get("notes", "parsed without response_format"),
+        }
+    except Exception as e:
+        return {
+            "label": "average",
+            "wpm_factor": 1.0,
+            "notes": f"default difficulty (LLM error: {e})",
+        }
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button("⬇️ Download CSV", to_csv(st.session_state["results"]), "estimates.csv", "text/csv")
-    with c2:
-        st.download_button("⬇️ Download JSON", to_json(st.session_state["results"]), "estimates.json", "application/json")
 
-st.divider()
-st.caption(
-    "Configured entirely via Streamlit Secrets. Supports Canvas Pages/Assignments/Discussions, Files (PDF/DOCX/PPTX), "
-    "manual video durations, quiz heuristic, UG/Grad toggle, and optional Azure LLM difficulty."
-)
+# -------------------------------------------------------------------
+# DO-time estimation
+# -------------------------------------------------------------------
+
+
+def azure_llm_task_time(
+    text: str,
+    item_type: str,
+    level: str,
+    endpoint: str,
+    model: str,
+    api_key: str,
+    max_chars: int,
+    api_version: str,
+) -> Dict:
+    """
+    Ask Azure OpenAI to estimate *DO* time for an item.
+
+    Returns dict:
+      {
+        "do_minutes": float,
+        "rationale": str
+      }
+    """
+    client = azure_llm_client(endpoint, api_key, api_version)
+
+    sys_msg = (
+        "You are a workload estimator for university courses. "
+        "You MUST respond with ONLY a JSON object that has keys:\n"
+        "  do_minutes (float, minutes required to complete the task, "
+        "              not including reading time),\n"
+        "  rationale (string, short explanation).\n"
+        "Assume typical students working at a realistic, not ideal, pace."
+    )
+
+    user_msg = (
+        f"Item type: {item_type}\n"
+        f"Student level: {level}\n\n"
+        "Below are the full student-facing instructions and/or description. "
+        "Estimate how long it will take the AVERAGE student to complete this item "
+        "(writing, problem solving, posting, etc.), EXCLUDING reading time.\n\n"
+        f"TEXT:\n{text[:max_chars]}"
+    )
+
+    # Try JSON mode
+    try:
+        cc = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = cc.choices[0].message.content
+        data = json.loads(raw)
+        return {
+            "do_minutes": float(data.get("do_minutes", 0.0)),
+            "rationale": data.get("rationale", "no rationale provided"),
+        }
+    except Exception:
+        pass
+
+    # Fallback
+    try:
+        cc = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+        )
+        raw = cc.choices[0].message.content
+        data = _coerce_json(raw) or {}
+        return {
+            "do_minutes": float(data.get("do_minutes", 0.0)),
+            "rationale": data.get("rationale", "fallback parse"),
+        }
+    except Exception as e:
+        return {
+            "do_minutes": 0.0,
+            "rationale": f"default 0 (LLM unavailable: {e})",
+        }
+
+
+def heuristic_task_time(words: int, item_type: str, level: str) -> float:
+    """
+    Rough fallback if LLM is off.
+
+    - Assignments: scale with instructions length.
+    - Discussions: base for original post + replies.
+    """
+    lvl_factor = 1.0 if level.lower().startswith("under") else 1.25
+
+    it = item_type.lower()
+    if it == "assignment":
+        if words < 150:
+            base = 30.0
+        elif words < 600:
+            base = 60.0
+        else:
+            base = 120.0
+        return base * lvl_factor
+
+    if it == "discussion":
+        base = 35.0  # ~20 min post + ~15 replies
+        return base * lvl_factor
+
+    return 0.0
+
+
+def estimate_quiz_time(meta: dict) -> float:
+    """
+    Basic heuristic for quiz DO time:
+    - If time_limit set: use that.
+    - Else: 2 minutes per question (fallback 10).
+    """
+    if not meta:
+        return 10.0
+    t = meta.get("time_limit")
+    if t:
+        return float(t)
+    qcount = meta.get("question_count") or meta.get("questions") or 5
+    try:
+        qcount = int(qcount)
+    except Exception:
+        qcount = 5
+    return max(5.0, qcount * 2.0)
+
+
+# -------------------------------------------------------------------
+# Video helpers
+# -------------------------------------------------------------------
+
+
+def hhmmss_to_seconds(hhmmss: str) -> int:
+    parts = hhmmss.strip().split(":")
+    if len(parts) != 3:
+        return 0
+    try:
+        h, m, s = [int(x) for x in parts]
+    except Exception:
+        return 0
+    return max(0, h * 3600 + m * 60 + s)
+
+
+# -------------------------------------------------------------------
+# Streamlit app
+# -------------------------------------------------------------------
+
+
+def main():
+    st.set_page_config(page_title="Course Load Estimator", layout="wide")
+    st.title("📚 Course Load Estimator")
+
+    if "items" not in st.session_state:
+        st.session_state["items"] = []
+    if "results" not in st.session_state:
+        st.session_state["results"] = []
+    if "pending_videos" not in st.session_state:
+        st.session_state["pending_videos"] = {}
+
+    st.sidebar.header("Configuration")
+
+    course_id = st.sidebar.text_input("Canvas Course ID", value="")
+    level = st.sidebar.selectbox("Student Level", ["Undergraduate", "Graduate"])
+    base_wpm = st.sidebar.slider("Base Reading Speed (words per minute)", 150, 350, 200, 10)
+    use_llm = st.sidebar.checkbox("Use Azure OpenAI for difficulty & DO time", value=True)
+
+    st.sidebar.markdown("### Azure OpenAI status")
+    if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
+        st.sidebar.warning("Azure OpenAI secrets missing or incomplete.")
+    else:
+        st.sidebar.success("Azure OpenAI configured.")
+
+    st.sidebar.markdown("### Canvas status")
+    if not (CANVAS_BASE and CANVAS_TOKEN):
+        st.sidebar.error("Canvas secrets missing or incomplete.")
+    else:
+        st.sidebar.success("Canvas configured.")
+
+    st.markdown(
+        """
+This tool estimates student workload per module by breaking it into:
+
+- **READ** – reading Canvas pages, assignment prompts, discussions, and document files  
+- **WATCH** – watching embedded / linked videos  
+- **DO** – completing assignments, discussions, and quizzes
+"""
+    )
+
+    # ------------------------------------------------------------------
+    # 1) Scan Course
+    # ------------------------------------------------------------------
+    st.header("1) Scan Course")
+
+    if st.button("Scan course modules & items", type="primary"):
+        if not course_id:
+            st.error("Enter a Canvas Course ID.")
+        elif not (CANVAS_BASE and CANVAS_TOKEN):
+            st.error("Canvas configuration not set.")
+        else:
+            try:
+                with st.spinner("Fetching modules and items from Canvas..."):
+                    items = get_modules_with_items(int(course_id))
+                st.session_state["items"] = items
+                st.session_state["results"] = []
+                st.session_state["pending_videos"] = {}
+                st.success(f"Found {len(items)} module items.")
+            except Exception as e:
+                st.error(f"Canvas API error: {e}")
+
+    if st.session_state["items"]:
+        st.write(f"Total items discovered: **{len(st.session_state['items'])}**")
+        with st.expander("Preview raw module items"):
+            st.json(st.session_state["items"])
+
+    # ------------------------------------------------------------------
+    # 2) Process items (READ + DO, plus video detection)
+    # ------------------------------------------------------------------
+    st.header("2) Estimate READ and DO time")
+
+    if st.button("Process items for workload"):
+        items = st.session_state.get("items", [])
+        if not items:
+            st.warning("No items scanned yet. Run 'Scan Course' first.")
+        else:
+            if use_llm and not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
+                st.error("Azure OpenAI is not configured, or secrets missing.")
+            else:
+                results = []
+                pending_videos = {}
+                for it in items:
+                    item_type = it["item_type"]
+                    title = it["title"]
+                    html_url = it["html_url"]
+                    item_key = it.get("item_key")
+
+                    read_min = 0.0
+                    watch_min = 0.0
+                    do_min = 0.0
+                    difficulty = default_difficulty()
+
+                    # -------------------
+                    # Pages / Assignments / Discussions
+                    # -------------------
+                    if item_type in ("Page", "Assignment", "Discussion"):
+                        try:
+                            if item_type == "Page":
+                                body = get_page_body(int(course_id), it.get("page_url"))
+                            elif item_type == "Assignment":
+                                a = get_assignment(int(course_id), it.get("content_id"))
+                                body = a.get("description", "") or ""
+                            else:  # Discussion
+                                d = get_discussion(int(course_id), it.get("content_id"))
+                                body = d.get("message", "") or ""
+                        except Exception:
+                            body = ""
+
+                        text = strip_html_to_text(body)
+
+                        # Detect videos in the HTML
+                        vids = detect_videos_from_html(body)
+                        for idx, v in enumerate(vids, start=1):
+                            v_key = f"{item_key}::embed::{idx}"
+                            pending_videos[v_key] = {
+                                "title": v.get("title", "Video"),
+                                "src": v.get("src", ""),
+                                "hhmmss": "00:00:00",
+                                "seconds": 0,
+                                "item_key": item_key,
+                            }
+
+                        words = words_from_text(text)
+
+                        # Reading time via LLM difficulty
+                        if words > 0:
+                            if use_llm:
+                                try:
+                                    difficulty = azure_llm_difficulty(
+                                        text,
+                                        AZ_ENDPOINT,
+                                        AZ_MODEL,
+                                        AZ_API_KEY,
+                                        AZ_MAX_CHARS,
+                                        AZ_API_VERSION,
+                                    )
+                                except Exception as e:
+                                    st.warning(f"LLM difficulty failed for '{title}': {e}")
+                                    difficulty = default_difficulty()
+                            read_min = reading_minutes(words, base_wpm, difficulty)
+
+                        # DO time via LLM / heuristic (assignments & discussions only)
+                        if item_type in ("Assignment", "Discussion"):
+                            if words > 0:
+                                if use_llm:
+                                    try:
+                                        task = azure_llm_task_time(
+                                            text,
+                                            item_type,
+                                            level,
+                                            AZ_ENDPOINT,
+                                            AZ_MODEL,
+                                            AZ_API_KEY,
+                                            AZ_MAX_CHARS,
+                                            AZ_API_VERSION,
+                                        )
+                                        do_min = float(task.get("do_minutes", 0.0))
+                                        difficulty["work_rationale"] = task.get("rationale", "")
+                                    except Exception as e:
+                                        st.warning(f"LLM task-time failed for '{title}', using heuristic: {e}")
+                                        do_min = heuristic_task_time(words, item_type, level)
+                                else:
+                                    do_min = heuristic_task_time(words, item_type, level)
+
+                    # -------------------
+                    # Files (PDF / DOCX / PPTX / etc.)
+                    # -------------------
+                    elif item_type == "File":
+                        cd = it.get("content_details") or {}
+                        file_url = cd.get("url")
+                        content_type = cd.get("content_type", "")
+                        if file_url:
+                            text, pages = extract_file_text(file_url, content_type, MAX_FILE_BYTES)
+                            words = words_from_text(text)
+                            if words > 0:
+                                if use_llm:
+                                    try:
+                                        difficulty = azure_llm_difficulty(
+                                            text,
+                                            AZ_ENDPOINT,
+                                            AZ_MODEL,
+                                            AZ_API_KEY,
+                                            AZ_MAX_CHARS,
+                                            AZ_API_VERSION,
+                                        )
+                                    except Exception as e:
+                                        st.warning(f"LLM difficulty failed for file '{title}': {e}")
+                                        difficulty = default_difficulty()
+                                read_min = reading_minutes(words, base_wpm, difficulty)
+                            else:
+                                # page-based fallback, esp. PPTX or scans
+                                mp = 2.0 if "presentation" in (content_type or "").lower() else 3.5
+                                read_min = pages * mp
+
+                    # -------------------
+                    # Quizzes
+                    # -------------------
+                    elif item_type == "Quiz":
+                        q_meta = it.get("content_details") or {}
+                        quiz_id = it.get("content_id")
+                        do_min = estimate_quiz_time(q_meta)
+                        # If LLM is enabled, refine using quiz description
+                        if use_llm and quiz_id:
+                            try:
+                                quiz = get_quiz(int(course_id), quiz_id)
+                                q_text = strip_html_to_text(quiz.get("description", "") or "")
+                                meta_str = (
+                                    f"\n\n[Metadata: question_count="
+                                    f"{q_meta.get('question_count') or quiz.get('question_count')}, "
+                                    f"time_limit={q_meta.get('time_limit') or quiz.get('time_limit')} minutes]"
+                                )
+                                task = azure_llm_task_time(
+                                    q_text + meta_str,
+                                    "Quiz",
+                                    level,
+                                    AZ_ENDPOINT,
+                                    AZ_MODEL,
+                                    AZ_API_KEY,
+                                    AZ_MAX_CHARS,
+                                    AZ_API_VERSION,
+                                )
+                                do_min = float(task.get("do_minutes", do_min))
+                                difficulty["work_rationale"] = task.get("rationale", "")
+                            except Exception as e:
+                                st.warning(
+                                    f"LLM task-time for quiz '{title}' failed "
+                                    f"(using heuristic {do_min:.1f} min): {e}"
+                                )
+
+                    # -------------------
+                    # External links (videos)
+                    # -------------------
+                    else:
+                        if any(
+                            dom in (html_url or "")
+                            for dom in ("youtube", "youtu.be", "vimeo", "echo360", "panopto", "kaltura")
+                        ):
+                            v_key = f"{item_key}::external"
+                            pending_videos[v_key] = {
+                                "title": title or "External Video",
+                                "src": html_url,
+                                "hhmmss": "00:00:00",
+                                "seconds": 0,
+                                "item_key": item_key,
+                            }
+
+                    total = read_min + watch_min + do_min
+                    results.append(
+                        {
+                            "module": it["module_name"],
+                            "title": title,
+                            "type": item_type,
+                            "url": html_url,
+                            "item_key": item_key,
+                            "read_min": round(read_min, 2),
+                            "watch_min": round(watch_min, 2),
+                            "do_min": round(do_min, 2),
+                            "total_min": round(total, 2),
+                            "difficulty": difficulty,
+                        }
+                    )
+
+                st.session_state["results"] = results
+                st.session_state["pending_videos"] = pending_videos
+                st.success(f"Processed {len(results)} items. Videos detected: {len(pending_videos)}")
+
+    # ------------------------------------------------------------------
+    # 3) Manual video durations
+    # ------------------------------------------------------------------
+    st.header("3) Enter video durations (hh:mm:ss)")
+
+    pending = st.session_state.get("pending_videos", {})
+    if pending:
+        for v_key, meta in list(pending.items()):
+            with st.expander(f"{meta['title']} — {meta.get('src','')}"):
+                hhmmss = st.text_input(
+                    "Duration (hh:mm:ss)",
+                    key=f"dur_{v_key}",
+                    value=meta.get("hhmmss", "00:00:00"),
+                )
+                if st.button("💾 Save", key=f"save_{v_key}"):
+                    sec = hhmmss_to_seconds(hhmmss)
+                    if sec <= 0:
+                        st.error("Invalid hh:mm:ss (must be > 00:00:00).")
+                    else:
+                        meta["hhmmss"] = hhmmss
+                        meta["seconds"] = sec
+                        st.success("Saved. Totals will update below when table is rendered.")
+
+        # Recompute watch_min per item
+        item_seconds = {}
+        for meta in pending.values():
+            ik = meta.get("item_key")
+            if not ik:
+                continue
+            item_seconds[ik] = item_seconds.get(ik, 0) + meta.get("seconds", 0)
+
+        for r in st.session_state.get("results", []):
+            ik = r.get("item_key")
+            sec_total = item_seconds.get(ik, 0)
+            watch_min = sec_total / 60.0
+            r["watch_min"] = round(watch_min, 2)
+            r["total_min"] = round(r["read_min"] + r["watch_min"] + r["do_min"], 2)
+
+    else:
+        st.info("No videos detected yet. They’ll appear here after processing items.")
+
+    # ------------------------------------------------------------------
+    # 4) Summary tables
+    # ------------------------------------------------------------------
+    st.header("4) Workload summary")
+
+    results = st.session_state.get("results", [])
+    if not results:
+        st.info("No workload results yet. Process items to see estimates.")
+        return
+
+    import pandas as pd
+
+    df = pd.DataFrame(results)
+
+    # Module-level aggregation
+    mod_summary = (
+        df.groupby("module")[["read_min", "watch_min", "do_min", "total_min"]]
+        .sum()
+        .reset_index()
+        .sort_values("module")
+    )
+
+    st.subheader("Per-module totals (minutes)")
+    st.dataframe(mod_summary, use_container_width=True)
+
+    st.subheader("Item-level details")
+    show_cols = ["module", "type", "title", "read_min", "watch_min", "do_min", "total_min", "url"]
+    st.dataframe(df[show_cols], use_container_width=True)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download item-level CSV",
+        data=csv,
+        file_name="course_load_estimates.csv",
+        mime="text/csv",
+    )
+
+
+if __name__ == "__main__":
+    main()
