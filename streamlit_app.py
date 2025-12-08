@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-import pandas as pd  # <-- moved to top so we can use it for KPIs and summary
+import pandas as pd
 
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text
@@ -83,14 +83,6 @@ def canvas_get(url: str, params=None) -> List[dict]:
         params = None
     return out
 
-def minutes_to_hhmm(minutes: float) -> str:
-    """Convert a float number of minutes to HH:MM."""
-    if minutes is None or math.isnan(minutes):
-        return "00:00"
-    total_minutes = int(round(minutes))
-    hours, mins = divmod(total_minutes, 60)
-    return f"{hours:02d}:{mins:02d}"
-
 
 # -------------------------------------------------------------------
 # Canvas API helpers
@@ -106,7 +98,7 @@ def get_modules_with_items(course_id: int) -> List[dict]:
             items.append(
                 {
                     "module_name": mod.get("name", ""),
-                    "position": mod.get("position", 0),  # module position from Canvas
+                    "position": mod.get("position", 0),  # module order from Canvas
                     "item_type": it.get("type", ""),
                     "title": it.get("title", ""),
                     "html_url": it.get("html_url", ""),
@@ -147,6 +139,16 @@ def get_quiz(course_id: int, quiz_id: int) -> dict:
     return r.json()
 
 
+def get_file_metadata(course_id: int, file_id: int) -> dict:
+    """
+    Fetch metadata for a Canvas file that belongs to a course.
+    """
+    url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/files/{file_id}"
+    r = requests.get(url, headers=canvas_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 # -------------------------------------------------------------------
 # Text / file handling
 # -------------------------------------------------------------------
@@ -174,7 +176,7 @@ def detect_videos_from_html(html: str) -> List[dict]:
         return videos
     soup = BeautifulSoup(html, "html.parser")
 
-    # iframe / video tags
+    # iframe / video / embed tags
     for tag in soup.find_all(["iframe", "video", "embed"]):
         src = tag.get("src") or tag.get("data-src") or ""
         if not src:
@@ -244,6 +246,40 @@ def extract_file_text(file_url: str, content_type: str, max_bytes: int) -> Tuple
     return text, 0
 
 
+def detect_canvas_files_from_html(html: str, course_id: int) -> List[dict]:
+    """
+    Find Canvas file links inside HTML and return a list of file metadata dicts.
+
+    We look for anchors whose href contains '/files/<id>'.
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    file_ids = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/files/" not in href:
+            continue
+        m = re.search(r"/files/(\d+)", href)
+        if not m:
+            continue
+        file_id = int(m.group(1))
+        file_ids.add(file_id)
+
+    files = []
+    for fid in file_ids:
+        try:
+            meta = get_file_metadata(course_id, fid)
+            files.append(meta)
+        except Exception:
+            # If one file fails, just skip it instead of crashing
+            continue
+
+    return files
+
+
 # -------------------------------------------------------------------
 # Difficulty & reading time
 # -------------------------------------------------------------------
@@ -267,7 +303,6 @@ def _coerce_json(raw: str):
     if not raw:
         return None
     raw = raw.strip()
-    # Try to extract JSON object
     m = re.search(r"{.*}", raw, flags=re.DOTALL)
     if not m:
         return None
@@ -312,7 +347,7 @@ def azure_llm_difficulty(
         f"TEXT:\n{text[:max_chars]}"
     )
 
-    # First attempt: JSON mode
+    # JSON mode
     try:
         cc = client.chat.completions.create(
             model=model,
@@ -491,7 +526,7 @@ def estimate_quiz_time(meta: dict) -> float:
 
 
 # -------------------------------------------------------------------
-# Video helpers
+# Video helpers & time formatting
 # -------------------------------------------------------------------
 
 
@@ -504,6 +539,18 @@ def hhmmss_to_seconds(hhmmss: str) -> int:
     except Exception:
         return 0
     return max(0, h * 3600 + m * 60 + s)
+
+
+def minutes_to_hhmm(minutes: float) -> str:
+    """Convert a float number of minutes to HH:MM."""
+    if minutes is None:
+        return "00:00"
+    try:
+        total_minutes = int(round(minutes))
+    except Exception:
+        return "00:00"
+    hours, mins = divmod(total_minutes, 60)
+    return f"{hours:02d}:{mins:02d}"
 
 
 # -------------------------------------------------------------------
@@ -525,17 +572,16 @@ def main():
     # ---------------- KPIs at top (from grand totals) ----------------
     if st.session_state.get("results"):
         df_all = pd.DataFrame(st.session_state["results"])
-        total_read = df_all["read_min"].sum()
-        total_watch = df_all["watch_min"].sum()
-        total_do = df_all["do_min"].sum()
-        total_total = df_all["total_min"].sum()
+        total_read = df_all.get("read_min", pd.Series(dtype=float)).sum()
+        total_watch = df_all.get("watch_min", pd.Series(dtype=float)).sum()
+        total_do = df_all.get("do_min", pd.Series(dtype=float)).sum()
+        total_total = df_all.get("total_min", pd.Series(dtype=float)).sum()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Read (hh:mm)", minutes_to_hhmm(total_read))
         c2.metric("Total Watch (hh:mm)", minutes_to_hhmm(total_watch))
         c3.metric("Total Do (hh:mm)", minutes_to_hhmm(total_do))
         c4.metric("Total Workload (hh:mm)", minutes_to_hhmm(total_total))
-
 
     st.sidebar.header("Configuration")
 
@@ -560,8 +606,8 @@ def main():
         """
 This tool estimates student workload per module by breaking it into:
 
-- **READ** – reading Canvas pages, assignment prompts, discussions, and document files  
-- **WATCH** – watching embedded / linked videos  
+- **READ** – Canvas pages, assignments, discussions, and **documents (including docs linked inside pages)**  
+- **WATCH** – embedded / linked videos  
 - **DO** – completing assignments, discussions, and quizzes
 """
     )
@@ -593,7 +639,7 @@ This tool estimates student workload per module by breaking it into:
             st.json(st.session_state["items"])
 
     # ------------------------------------------------------------------
-    # 2) Process items (READ + DO, plus video detection)
+    # 2) Process items (READ + DO, plus video & linked-doc detection)
     # ------------------------------------------------------------------
     st.header("2) Estimate READ and DO time")
 
@@ -650,7 +696,7 @@ This tool estimates student workload per module by breaking it into:
 
                         words = words_from_text(text)
 
-                        # Reading time via LLM difficulty
+                        # Reading time for on-page text
                         if words > 0:
                             if use_llm:
                                 try:
@@ -666,6 +712,49 @@ This tool estimates student workload per module by breaking it into:
                                     st.warning(f"LLM difficulty failed for '{title}': {e}")
                                     difficulty = default_difficulty()
                             read_min = reading_minutes(words, base_wpm, difficulty)
+
+                        # Reading time for linked Canvas files (PDF/DOCX/PPT, etc.)
+                        try:
+                            linked_files = detect_canvas_files_from_html(body, int(course_id))
+                        except Exception as e:
+                            linked_files = []
+                            st.warning(f"Linked-file detection failed for '{title}': {e}")
+
+                        for fmeta in linked_files:
+                            file_url = fmeta.get("url") or fmeta.get("download_url")
+                            content_type = (
+                                fmeta.get("content-type")
+                                or fmeta.get("content_type")
+                                or ""
+                            )
+                            if not file_url:
+                                continue
+                            try:
+                                f_text, f_pages = extract_file_text(file_url, content_type, MAX_FILE_BYTES)
+                            except Exception:
+                                f_text, f_pages = "", 0
+
+                            f_words = words_from_text(f_text)
+                            if f_words > 0:
+                                if use_llm:
+                                    try:
+                                        f_diff = azure_llm_difficulty(
+                                            f_text,
+                                            AZ_ENDPOINT,
+                                            AZ_MODEL,
+                                            AZ_API_KEY,
+                                            AZ_MAX_CHARS,
+                                            AZ_API_VERSION,
+                                        )
+                                    except Exception:
+                                        f_diff = default_difficulty()
+                                else:
+                                    f_diff = default_difficulty()
+                                read_min += reading_minutes(f_words, base_wpm, f_diff)
+                            else:
+                                # page-based fallback (slides/scans)
+                                mp = 2.0 if "presentation" in (content_type or "").lower() else 3.5
+                                read_min += f_pages * mp
 
                         # DO time via LLM / heuristic (assignments & discussions only)
                         if item_type in ("Assignment", "Discussion"):
@@ -691,7 +780,7 @@ This tool estimates student workload per module by breaking it into:
                                     do_min = heuristic_task_time(words, item_type, level)
 
                     # -------------------
-                    # Files (PDF / DOCX / PPTX / etc.)
+                    # Files (PDF / DOCX / PPTX / etc.) as module items
                     # -------------------
                     elif item_type == "File":
                         cd = it.get("content_details") or {}
@@ -727,7 +816,6 @@ This tool estimates student workload per module by breaking it into:
                         q_meta = it.get("content_details") or {}
                         quiz_id = it.get("content_id")
                         do_min = estimate_quiz_time(q_meta)
-                        # If LLM is enabled, refine using quiz description
                         if use_llm and quiz_id:
                             try:
                                 quiz = get_quiz(int(course_id), quiz_id)
@@ -756,7 +844,7 @@ This tool estimates student workload per module by breaking it into:
                                 )
 
                     # -------------------
-                    # External links (videos)
+                    # External links (videos-only items)
                     # -------------------
                     else:
                         if any(
@@ -776,7 +864,7 @@ This tool estimates student workload per module by breaking it into:
                     results.append(
                         {
                             "module": it["module_name"],
-                            "module_position": it.get("position", 0),  # <-- carry module order into results
+                            "module_position": it.get("position", 0),
                             "title": title,
                             "type": item_type,
                             "url": html_url,
@@ -794,7 +882,7 @@ This tool estimates student workload per module by breaking it into:
                 st.success(f"Processed {len(results)} items. Videos detected: {len(pending_videos)}")
 
     # ------------------------------------------------------------------
-    # 3) Manual video durations (UNCHANGED LOGIC)
+    # 3) Manual video durations (per-video, unchanged in spirit)
     # ------------------------------------------------------------------
     st.header("3) Enter video durations (hh:mm:ss)")
 
@@ -835,10 +923,7 @@ This tool estimates student workload per module by breaking it into:
         st.info("No videos detected yet. They’ll appear here after processing items.")
 
     # ------------------------------------------------------------------
-    # 4) Summary tables (with module order + Grand Total)
-    # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-    # 4) Workload summary (with module order + Grand Total)
+    # 4) Workload summary (module order + Grand Total)
     # ------------------------------------------------------------------
     st.header("4) Workload summary")
 
@@ -849,20 +934,17 @@ This tool estimates student workload per module by breaking it into:
 
     df = pd.DataFrame(results)
 
-    # --- Ensure module_position exists (for older results or partial runs) ---
+    # Ensure module_position exists for grouping (for older runs, etc.)
     if "module_position" not in df.columns:
-        # Build a mapping from module name -> position from the original items
         module_order = {}
         for it in st.session_state.get("items", []):
             mn = it.get("module_name", "")
             pos = it.get("position", 0)
-            # keep the smallest position seen for that module
             if mn not in module_order or pos < module_order[mn]:
                 module_order[mn] = pos
-
         df["module_position"] = df["module"].map(lambda m: module_order.get(m, 0))
 
-    # Module-level aggregation with proper ordering
+    # Module-level aggregation with ordering
     mod_summary = (
         df.groupby(["module", "module_position"])[["read_min", "watch_min", "do_min", "total_min"]]
         .sum()
@@ -870,7 +952,7 @@ This tool estimates student workload per module by breaking it into:
         .sort_values("module_position")
     )
 
-    # Build Grand Total row
+    # Grand Total row
     grand_totals = {
         "module": "Grand Total",
         "module_position": mod_summary["module_position"].max() + 1 if len(mod_summary) else 9999,
@@ -885,7 +967,6 @@ This tool estimates student workload per module by breaking it into:
         ignore_index=True,
     )
 
-    # Drop module_position for display, but keep order
     mod_summary_display = mod_summary_with_total.drop(columns=["module_position"])
 
     st.subheader("Per-module totals (minutes)")
