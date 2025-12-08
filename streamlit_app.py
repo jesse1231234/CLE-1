@@ -83,6 +83,14 @@ def canvas_get(url: str, params=None) -> List[dict]:
         params = None
     return out
 
+def minutes_to_hhmm(minutes: float) -> str:
+    """Convert a float number of minutes to HH:MM."""
+    if minutes is None or math.isnan(minutes):
+        return "00:00"
+    total_minutes = int(round(minutes))
+    hours, mins = divmod(total_minutes, 60)
+    return f"{hours:02d}:{mins:02d}"
+
 
 # -------------------------------------------------------------------
 # Canvas API helpers
@@ -523,10 +531,11 @@ def main():
         total_total = df_all["total_min"].sum()
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Read (min)", f"{total_read:.1f}")
-        c2.metric("Total Watch (min)", f"{total_watch:.1f}")
-        c3.metric("Total Do (min)", f"{total_do:.1f}")
-        c4.metric("Total Workload (min)", f"{total_total:.1f}")
+        c1.metric("Total Read (hh:mm)", minutes_to_hhmm(total_read))
+        c2.metric("Total Watch (hh:mm)", minutes_to_hhmm(total_watch))
+        c3.metric("Total Do (hh:mm)", minutes_to_hhmm(total_do))
+        c4.metric("Total Workload (hh:mm)", minutes_to_hhmm(total_total))
+
 
     st.sidebar.header("Configuration")
 
