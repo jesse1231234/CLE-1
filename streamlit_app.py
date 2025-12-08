@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+import pandas as pd  # <-- moved to top so we can use it for KPIs and summary
 
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text
@@ -97,7 +98,7 @@ def get_modules_with_items(course_id: int) -> List[dict]:
             items.append(
                 {
                     "module_name": mod.get("name", ""),
-                    "position": mod.get("position", 0),
+                    "position": mod.get("position", 0),  # module position from Canvas
                     "item_type": it.get("type", ""),
                     "title": it.get("title", ""),
                     "html_url": it.get("html_url", ""),
@@ -513,6 +514,20 @@ def main():
     if "pending_videos" not in st.session_state:
         st.session_state["pending_videos"] = {}
 
+    # ---------------- KPIs at top (from grand totals) ----------------
+    if st.session_state.get("results"):
+        df_all = pd.DataFrame(st.session_state["results"])
+        total_read = df_all["read_min"].sum()
+        total_watch = df_all["watch_min"].sum()
+        total_do = df_all["do_min"].sum()
+        total_total = df_all["total_min"].sum()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Read (min)", f"{total_read:.1f}")
+        c2.metric("Total Watch (min)", f"{total_watch:.1f}")
+        c3.metric("Total Do (min)", f"{total_do:.1f}")
+        c4.metric("Total Workload (min)", f"{total_total:.1f}")
+
     st.sidebar.header("Configuration")
 
     course_id = st.sidebar.text_input("Canvas Course ID", value="")
@@ -752,6 +767,7 @@ This tool estimates student workload per module by breaking it into:
                     results.append(
                         {
                             "module": it["module_name"],
+                            "module_position": it.get("position", 0),  # <-- carry module order into results
                             "title": title,
                             "type": item_type,
                             "url": html_url,
@@ -769,7 +785,7 @@ This tool estimates student workload per module by breaking it into:
                 st.success(f"Processed {len(results)} items. Videos detected: {len(pending_videos)}")
 
     # ------------------------------------------------------------------
-    # 3) Manual video durations
+    # 3) Manual video durations (UNCHANGED LOGIC)
     # ------------------------------------------------------------------
     st.header("3) Enter video durations (hh:mm:ss)")
 
@@ -810,7 +826,7 @@ This tool estimates student workload per module by breaking it into:
         st.info("No videos detected yet. They’ll appear here after processing items.")
 
     # ------------------------------------------------------------------
-    # 4) Summary tables
+    # 4) Summary tables (with module order + Grand Total)
     # ------------------------------------------------------------------
     st.header("4) Workload summary")
 
@@ -819,26 +835,42 @@ This tool estimates student workload per module by breaking it into:
         st.info("No workload results yet. Process items to see estimates.")
         return
 
-    import pandas as pd
-
     df = pd.DataFrame(results)
 
-    # Module-level aggregation
+    # Module-level aggregation with proper ordering
     mod_summary = (
-        df.groupby("module")[["read_min", "watch_min", "do_min", "total_min"]]
+        df.groupby(["module", "module_position"])[["read_min", "watch_min", "do_min", "total_min"]]
         .sum()
         .reset_index()
-        .sort_values("module")
+        .sort_values("module_position")
     )
 
+    # Build Grand Total row
+    grand_totals = {
+        "module": "Grand Total",
+        "module_position": mod_summary["module_position"].max() + 1 if len(mod_summary) else 9999,
+        "read_min": mod_summary["read_min"].sum(),
+        "watch_min": mod_summary["watch_min"].sum(),
+        "do_min": mod_summary["do_min"].sum(),
+        "total_min": mod_summary["total_min"].sum(),
+    }
+
+    mod_summary_with_total = pd.concat(
+        [mod_summary, pd.DataFrame([grand_totals])],
+        ignore_index=True,
+    )
+
+    # Drop module_position for display, but keep order
+    mod_summary_display = mod_summary_with_total.drop(columns=["module_position"])
+
     st.subheader("Per-module totals (minutes)")
-    st.dataframe(mod_summary, use_container_width=True)
+    st.dataframe(mod_summary_display, use_container_width=True)
 
     st.subheader("Item-level details")
     show_cols = ["module", "type", "title", "read_min", "watch_min", "do_min", "total_min", "url"]
     st.dataframe(df[show_cols], use_container_width=True)
 
-    csv = df.to_csv(index=False).encode("utf-8")
+    csv = df[show_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download item-level CSV",
         data=csv,
