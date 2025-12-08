@@ -828,6 +828,9 @@ This tool estimates student workload per module by breaking it into:
     # ------------------------------------------------------------------
     # 4) Summary tables (with module order + Grand Total)
     # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    # 4) Workload summary (with module order + Grand Total)
+    # ------------------------------------------------------------------
     st.header("4) Workload summary")
 
     results = st.session_state.get("results", [])
@@ -836,6 +839,19 @@ This tool estimates student workload per module by breaking it into:
         return
 
     df = pd.DataFrame(results)
+
+    # --- Ensure module_position exists (for older results or partial runs) ---
+    if "module_position" not in df.columns:
+        # Build a mapping from module name -> position from the original items
+        module_order = {}
+        for it in st.session_state.get("items", []):
+            mn = it.get("module_name", "")
+            pos = it.get("position", 0)
+            # keep the smallest position seen for that module
+            if mn not in module_order or pos < module_order[mn]:
+                module_order[mn] = pos
+
+        df["module_position"] = df["module"].map(lambda m: module_order.get(m, 0))
 
     # Module-level aggregation with proper ordering
     mod_summary = (
