@@ -1,14 +1,13 @@
 import io
 import json
-import math
 import os
 import re
 from typing import Dict, List, Tuple, Optional
 
+import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-import pandas as pd
 
 try:
     from pdfminer.high_level import extract_text as pdf_extract_text
@@ -31,9 +30,24 @@ except Exception:
     AzureOpenAI = None
 
 
-# -------------------------------------------------------------------
-# Config & constants
-# -------------------------------------------------------------------
+# ============================================================
+# Settings / Constants
+# ============================================================
+
+MAX_FILE_BYTES = 25 * 1024 * 1024
+LLM_SAMPLE_CHARS = 5000
+
+# Sanity caps: prevent absurd values when extraction goes sideways
+MAX_REASONABLE_WORDS_PER_DOC = 200_000
+MAX_REASONABLE_MINUTES_PER_DOC = 1_000
+
+# Heuristics for non-text
+MIN_PER_PDF_PAGE = 3.5
+MIN_PER_PPT_SLIDE = 2.0
+
+# Prefer formats (within a single item) when same filename appears as PDF + PPTX etc.
+PREFERRED_EXT_ORDER = ["pdf", "docx", "doc", "txt", "html", "htm", "pptx", "ppt"]
+
 
 def get_secret(name: str, default=None):
     try:
@@ -42,34 +56,107 @@ def get_secret(name: str, default=None):
         return os.getenv(name, default)
 
 
-CANVAS_BASE = get_secret("CANVAS_BASE_URL", "").rstrip("/")
-CANVAS_TOKEN = get_secret("CANVAS_API_TOKEN", "")
+CANVAS_BASE = (get_secret("CANVAS_BASE_URL", "") or "").rstrip("/")
+CANVAS_TOKEN = get_secret("CANVAS_API_TOKEN", "") or ""
 
-AZ_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT", "")
-AZ_API_KEY = get_secret("AZURE_OPENAI_API_KEY", "")
-AZ_MODEL = get_secret("AZURE_OPENAI_MODEL", "")
-AZ_API_VERSION = get_secret("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-
-MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
-AZ_MAX_CHARS = 15000
-
-# Sanity caps to prevent runaway counts from garbage extraction
-MAX_REASONABLE_WORDS = 200_000          # beyond this, treat extraction as junk
-MAX_REASONABLE_MINUTES_PER_FILE = 1_000 # beyond this, treat extraction as junk
+AZ_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT", "") or ""
+AZ_API_KEY = get_secret("AZURE_OPENAI_API_KEY", "") or ""
+AZ_MODEL = get_secret("AZURE_OPENAI_MODEL", "") or ""
+AZ_API_VERSION = get_secret("AZURE_OPENAI_API_VERSION", "2024-02-15-preview") or "2024-02-15-preview"
 
 
-# -------------------------------------------------------------------
-# HTTP helpers
-# -------------------------------------------------------------------
+# ============================================================
+# Utility: formatting
+# ============================================================
+
+def minutes_to_hhmm(minutes: float) -> str:
+    if minutes is None:
+        return "00:00"
+    try:
+        total = int(round(float(minutes)))
+    except Exception:
+        return "00:00"
+    h, m = divmod(max(total, 0), 60)
+    return f"{h:02d}:{m:02d}"
+
+
+def hhmmss_to_seconds(hhmmss: str) -> int:
+    parts = (hhmmss or "").strip().split(":")
+    if len(parts) != 3:
+        return 0
+    try:
+        h, m, s = [int(x) for x in parts]
+    except Exception:
+        return 0
+    return max(0, h * 3600 + m * 60 + s)
+
+
+# ============================================================
+# Utility: filename / type
+# ============================================================
+
+def file_ext(name: str) -> str:
+    name = (name or "").strip().lower()
+    m = re.search(r"\.([a-z0-9]+)$", name)
+    return m.group(1) if m else ""
+
+
+def file_stem(name: str) -> str:
+    name = (name or "").strip()
+    # remove extension
+    name = re.sub(r"\.[A-Za-z0-9]+$", "", name)
+    return name.strip().lower()
+
+
+def rank_ext(ext: str) -> int:
+    try:
+        return PREFERRED_EXT_ORDER.index(ext)
+    except ValueError:
+        return 999
+
+
+def dedupe_linked_files_by_stem(metas: List[dict]) -> List[dict]:
+    """
+    Dedupe within one item: if same doc exists as PDF + PPTX, prefer PDF.
+    Keyed by filename stem.
+    """
+    best: Dict[str, dict] = {}
+    for meta in metas:
+        name = meta.get("display_name") or meta.get("filename") or ""
+        stem = file_stem(name) or f"id:{meta.get('id')}"
+        ext = file_ext(name)
+
+        if stem not in best:
+            best[stem] = meta
+            continue
+
+        cur = best[stem]
+        cur_name = cur.get("display_name") or cur.get("filename") or ""
+        cur_ext = file_ext(cur_name)
+
+        if rank_ext(ext) < rank_ext(cur_ext):
+            best[stem] = meta
+
+    return list(best.values())
+
+
+def is_text_like_content_type(ct: str) -> bool:
+    ct = (ct or "").lower()
+    return ct.startswith("text/") or any(x in ct for x in ["json", "xml", "html"])
+
+
+# ============================================================
+# Canvas HTTP helpers
+# ============================================================
 
 def canvas_headers():
     if not CANVAS_TOKEN:
-        raise RuntimeError("Missing CANVAS_API_TOKEN in secrets/env.")
+        raise RuntimeError("Missing CANVAS_API_TOKEN.")
     return {"Authorization": f"Bearer {CANVAS_TOKEN}"}
 
 
 def canvas_get(url: str, params=None) -> List[dict]:
-    """Handle Canvas pagination."""
+    """Pagination-aware GET for Canvas list endpoints."""
     out = []
     while url:
         r = requests.get(url, headers=canvas_headers(), params=params, timeout=30)
@@ -79,6 +166,7 @@ def canvas_get(url: str, params=None) -> List[dict]:
             out.extend(data)
         else:
             out.append(data)
+
         link = r.headers.get("Link", "")
         next_url = None
         for part in link.split(","):
@@ -94,19 +182,24 @@ def canvas_get(url: str, params=None) -> List[dict]:
 @st.cache_data(show_spinner=False)
 def fetch_url_bytes(url: str, max_bytes: int) -> Tuple[bytes, str]:
     """
-    Download up to max_bytes from url and return (bytes, detected_content_type).
-    We use detected content type from HTTP headers to protect against missing metadata.
+    Fetch bytes from a Canvas signed URL. Returns (data, detected_content_type).
     """
-    r = requests.get(url, headers=canvas_headers(), stream=True, timeout=60, allow_redirects=True)
+    r = requests.get(
+        url,
+        headers=canvas_headers(),
+        timeout=60,
+        allow_redirects=True,
+        stream=True,
+    )
     r.raise_for_status()
     ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     data = r.content[:max_bytes]
     return data, ct
 
 
-# -------------------------------------------------------------------
-# Canvas API helpers
-# -------------------------------------------------------------------
+# ============================================================
+# Canvas API wrappers
+# ============================================================
 
 def get_modules_with_items(course_id: int) -> List[dict]:
     url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/modules"
@@ -117,7 +210,7 @@ def get_modules_with_items(course_id: int) -> List[dict]:
             items.append(
                 {
                     "module_name": mod.get("name", ""),
-                    "position": mod.get("position", 0),
+                    "module_position": mod.get("position", 0),
                     "item_type": it.get("type", ""),
                     "title": it.get("title", ""),
                     "html_url": it.get("html_url", ""),
@@ -158,35 +251,32 @@ def get_quiz(course_id: int, quiz_id: int) -> dict:
     return r.json()
 
 
-def get_file_metadata(course_id: int, file_id: int) -> dict:
+def get_course_file(course_id: int, file_id: int) -> dict:
     url = f"{CANVAS_BASE}/api/v1/courses/{course_id}/files/{file_id}"
     r = requests.get(url, headers=canvas_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-# -------------------------------------------------------------------
-# Text / HTML parsing
-# -------------------------------------------------------------------
+# ============================================================
+# HTML/Text extraction
+# ============================================================
 
 def strip_html_to_text(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script", "style"]):
         tag.decompose()
     text = soup.get_text(separator=" ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def words_from_text(text: str) -> int:
     """
-    IMPORTANT PATCH:
-    - Ignore 1-character "words" to avoid PDFs that extract as spaced letters
-      turning into millions of tokens.
+    Ignore 1-character tokens to prevent PDF spaced-letter artifacts
+    from inflating "word" counts.
     """
     if not text:
         return 0
-    # count tokens length >= 2 (letters/numbers/underscore/apostrophe)
     return len(re.findall(r"\b[\w']{2,}\b", text))
 
 
@@ -214,7 +304,8 @@ def detect_videos_from_html(html: str) -> List[dict]:
 
 def detect_canvas_file_ids_from_html(html: str) -> List[int]:
     """
-    Extract Canvas file IDs from HTML links that contain /files/<id>
+    Canvas-only: extract /files/<id> from links.
+    Ignores any URLs that aren't a Canvas file link.
     """
     if not html:
         return []
@@ -230,64 +321,64 @@ def detect_canvas_file_ids_from_html(html: str) -> List[int]:
     return sorted(ids)
 
 
-# -------------------------------------------------------------------
-# File extraction (PATCHED)
-# -------------------------------------------------------------------
+# ============================================================
+# File extraction (local) — Canvas hosted only
+# ============================================================
 
-def is_text_like_content_type(ct: str) -> bool:
-    ct = (ct or "").lower()
-    return ct.startswith("text/") or any(x in ct for x in ["json", "xml", "html"])
-
-
-def extract_file_text(file_url: str, content_type_hint: str, max_bytes: int) -> Tuple[str, int, str]:
+def extract_text_from_canvas_file(
+    file_url: str,
+    filename: str,
+    content_type_hint: str,
+    max_bytes: int,
+) -> Tuple[str, int, str]:
     """
-    Download a Canvas file and extract (text, pages_or_slides, detected_ct).
-
-    PATCHES:
-    - Use HTTP Content-Type header if hint is missing/wrong
-    - Never decode unknown binary as UTF-8 text
-    - PPTX returns empty text + slide_count
+    Returns (text, pages_or_slides, detected_ct).
+    PPTX: returns empty text + slide_count (never word-count PPTX).
+    Unknown binary: returns empty text.
     """
     if not file_url:
         return "", 0, ""
 
     data, detected_ct = fetch_url_bytes(file_url, max_bytes)
     ct = (content_type_hint or detected_ct or "").split(";")[0].strip().lower()
+    ext = file_ext(filename)
 
-    pages = 0
+    # PPTX: never extract words; slide heuristic only
+    if ext in ("pptx", "ppt") or "powerpoint" in ct:
+        if Presentation is not None:
+            try:
+                prs = Presentation(io.BytesIO(data))
+                return "", len(prs.slides), ct or "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            except Exception:
+                return "", 0, ct
+        return "", 0, ct
 
     # PDF
-    if "pdf" in ct and pdf_extract_text:
+    if ext == "pdf" or ("pdf" in ct):
+        if pdf_extract_text is None:
+            return "", 0, ct
         try:
             text = pdf_extract_text(io.BytesIO(data))
             pages = text.count("\f") or 0
-            return text, pages, ct
+            return text, pages, ct or "application/pdf"
         except Exception:
             return "", 0, ct
 
     # DOCX
-    if (("word" in ct) or ("docx" in ct)) and Document:
+    if ext in ("docx", "doc") or ("word" in ct) or ("docx" in ct):
+        if Document is None:
+            return "", 0, ct
         try:
             doc = Document(io.BytesIO(data))
             text = "\n".join(p.text for p in doc.paragraphs)
-            return text, 0, ct
+            return text, 0, ct or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         except Exception:
             return "", 0, ct
 
-    # PPTX
-    if (("powerpoint" in ct) or ("pptx" in ct)) and Presentation:
+    # Text-like
+    if is_text_like_content_type(ct) or ext in ("txt", "html", "htm", "csv", "md"):
         try:
-            prs = Presentation(io.BytesIO(data))
-            slide_count = len(prs.slides)
-            return "", slide_count, ct
-        except Exception:
-            return "", 0, ct
-
-    # PATCH: Only decode as text if content-type is text-like
-    if is_text_like_content_type(ct):
-        try:
-            text = data.decode("utf-8", errors="ignore")
-            return text, 0, ct
+            return data.decode("utf-8", errors="ignore"), 0, ct
         except Exception:
             return "", 0, ct
 
@@ -295,74 +386,52 @@ def extract_file_text(file_url: str, content_type_hint: str, max_bytes: int) -> 
     return "", 0, ct
 
 
-def estimate_minutes_from_pages_or_unknown(pages: int, content_type: str, size_bytes: Optional[int]) -> float:
-    """
-    Heuristic fallback:
-    - PPT/presentation: 2 min per slide
-    - Other: 3.5 min per page if pages known
-    - If no pages, use size-based minimums (conservative)
-    """
+def minutes_fallback_for_nontext(pages_or_slides: int, filename: str, content_type: str) -> float:
+    ext = file_ext(filename)
     ct = (content_type or "").lower()
-    if pages and ("presentation" in ct or "powerpoint" in ct or "pptx" in ct):
-        return float(pages) * 2.0
-    if pages:
-        return float(pages) * 3.5
-
-    # No pages: size-based fallback (very conservative)
-    if size_bytes:
-        mb = max(1.0, size_bytes / (1024 * 1024))
-        # 5 min per MB as a crude proxy, capped to avoid insane values
-        return min(120.0, 5.0 * mb)
-
-    return 10.0
+    if pages_or_slides <= 0:
+        # conservative default if we can't measure
+        return 10.0
+    if ext in ("pptx", "ppt") or ("powerpoint" in ct):
+        return float(pages_or_slides) * MIN_PER_PPT_SLIDE
+    return float(pages_or_slides) * MIN_PER_PDF_PAGE
 
 
-# -------------------------------------------------------------------
-# Difficulty & LLM
-# -------------------------------------------------------------------
+# ============================================================
+# LLM difficulty — SAMPLE ONLY
+# ============================================================
+
+def azure_llm_client():
+    if AzureOpenAI is None:
+        raise RuntimeError("openai SDK not installed.")
+    return AzureOpenAI(api_key=AZ_API_KEY, azure_endpoint=AZ_ENDPOINT.rstrip("/"), api_version=AZ_API_VERSION)
+
 
 def default_difficulty() -> Dict:
-    return {"label": "average", "wpm_factor": 1.0, "notes": "default difficulty (no LLM)"}
+    return {"label": "average", "wpm_factor": 1.0, "notes": "default (LLM off/failed)"}
 
 
-def reading_minutes(words: int, base_wpm: int, difficulty: Dict) -> float:
-    factor = float(difficulty.get("wpm_factor", 1.0) or 1.0)
-    wpm = max(80.0, base_wpm * factor)
-    return words / wpm
+def azure_llm_difficulty_sample(sample_text: str) -> Dict:
+    """
+    Uses ONLY a sample (<=5000 chars). Returns {label, wpm_factor, notes}.
+    """
+    if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
+        return default_difficulty()
 
-
-def _coerce_json(raw: str):
-    if not raw:
-        return None
-    raw = raw.strip()
-    m = re.search(r"{.*}", raw, flags=re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-
-def azure_llm_client(endpoint: str, api_key: str, api_version: str):
-    if AzureOpenAI is None:
-        raise RuntimeError("openai SDK not installed. pip install openai>=1.52.0")
-    return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint.rstrip("/"), api_version=api_version)
-
-
-def azure_llm_difficulty(text: str, endpoint: str, model: str, api_key: str, max_chars: int, api_version: str) -> Dict:
-    client = azure_llm_client(endpoint, api_key, api_version)
+    client = azure_llm_client()
     sys_msg = (
-        "You are a reading difficulty estimator. Return ONLY JSON with keys:\n"
-        "label one of ['very_easy','easy','average','hard','very_hard'], "
-        "wpm_factor float, notes string. "
-        "Very easy => 1.3, easy => 1.15, average => 1.0, hard => 0.8, very_hard => 0.65."
+        "You are a reading difficulty estimator for college coursework. "
+        "Return ONLY JSON with keys:\n"
+        "label: one of ['very_easy','easy','average','hard','very_hard']\n"
+        "wpm_factor: float multiplier relative to base reading speed\n"
+        "notes: short explanation\n"
+        "Use: very_easy=1.3, easy=1.15, average=1.0, hard=0.8, very_hard=0.65."
     )
-    user_msg = f"Estimate reading difficulty:\n\n{text[:max_chars]}"
+    user_msg = f"Estimate difficulty for this sample:\n\n{sample_text}"
 
     try:
         cc = client.chat.completions.create(
-            model=model,
+            model=AZ_MODEL,
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
             temperature=0,
             response_format={"type": "json_object"},
@@ -374,67 +443,65 @@ def azure_llm_difficulty(text: str, endpoint: str, model: str, api_key: str, max
             "notes": data.get("notes", ""),
         }
     except Exception:
-        pass
+        # fallback parse
+        try:
+            cc = client.chat.completions.create(
+                model=AZ_MODEL,
+                messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+                temperature=0,
+            )
+            raw = cc.choices[0].message.content or ""
+            m = re.search(r"{.*}", raw, flags=re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+                return {
+                    "label": data.get("label", "average"),
+                    "wpm_factor": float(data.get("wpm_factor", 1.0)),
+                    "notes": data.get("notes", "fallback parse"),
+                }
+        except Exception:
+            pass
+        return default_difficulty()
 
-    try:
-        cc = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            temperature=0,
-        )
-        data = _coerce_json(cc.choices[0].message.content) or {}
-        return {
-            "label": data.get("label", "average"),
-            "wpm_factor": float(data.get("wpm_factor", 1.0)),
-            "notes": data.get("notes", "parsed without response_format"),
-        }
-    except Exception as e:
-        return {"label": "average", "wpm_factor": 1.0, "notes": f"default (LLM error: {e})"}
+
+def reading_minutes_from_words(words: int, base_wpm: int, wpm_factor: float) -> float:
+    wpm = max(80.0, float(base_wpm) * max(0.1, float(wpm_factor)))
+    return float(words) / wpm
 
 
-def azure_llm_task_time(
-    text: str,
-    item_type: str,
-    level: str,
-    endpoint: str,
-    model: str,
-    api_key: str,
-    max_chars: int,
-    api_version: str,
-) -> Dict:
-    client = azure_llm_client(endpoint, api_key, api_version)
+# ============================================================
+# DO-time estimation (unchanged conceptually)
+# ============================================================
+
+def azure_llm_task_time(text: str, item_type: str, level: str) -> float:
+    """
+    Still uses item instructions text (not huge). You can keep as-is or sample it too.
+    """
+    if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL) or AzureOpenAI is None:
+        return 0.0
+
+    client = azure_llm_client()
     sys_msg = (
-        "You are a workload estimator. Return ONLY JSON with keys:\n"
-        "do_minutes (float, excluding reading time), rationale (string)."
+        "Return ONLY JSON with keys: do_minutes (float), rationale (string). "
+        "do_minutes excludes reading time."
     )
     user_msg = (
         f"Item type: {item_type}\nStudent level: {level}\n\n"
-        "Estimate completion time excluding reading time:\n\n"
-        f"{text[:max_chars]}"
+        "Estimate completion time excluding reading time.\n\n"
+        f"{text[:15000]}"
     )
 
     try:
         cc = client.chat.completions.create(
-            model=model,
+            model=AZ_MODEL,
             messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
             temperature=0,
             response_format={"type": "json_object"},
         )
         data = json.loads(cc.choices[0].message.content)
-        return {"do_minutes": float(data.get("do_minutes", 0.0)), "rationale": data.get("rationale", "")}
+        return float(data.get("do_minutes", 0.0))
     except Exception:
-        pass
-
-    try:
-        cc = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-            temperature=0,
-        )
-        data = _coerce_json(cc.choices[0].message.content) or {}
-        return {"do_minutes": float(data.get("do_minutes", 0.0)), "rationale": data.get("rationale", "")}
-    except Exception as e:
-        return {"do_minutes": 0.0, "rationale": f"default 0 (LLM unavailable: {e})"}
+        return 0.0
 
 
 def heuristic_task_time(words: int, item_type: str, level: str) -> float:
@@ -454,7 +521,7 @@ def estimate_quiz_time(meta: dict) -> float:
     t = meta.get("time_limit")
     if t:
         return float(t)
-    qcount = meta.get("question_count") or meta.get("questions") or 5
+    qcount = meta.get("question_count") or 5
     try:
         qcount = int(qcount)
     except Exception:
@@ -462,47 +529,20 @@ def estimate_quiz_time(meta: dict) -> float:
     return max(5.0, qcount * 2.0)
 
 
-# -------------------------------------------------------------------
-# Video & KPI formatting
-# -------------------------------------------------------------------
-
-def hhmmss_to_seconds(hhmmss: str) -> int:
-    parts = hhmmss.strip().split(":")
-    if len(parts) != 3:
-        return 0
-    try:
-        h, m, s = [int(x) for x in parts]
-    except Exception:
-        return 0
-    return max(0, h * 3600 + m * 60 + s)
-
-
-def minutes_to_hhmm(minutes: float) -> str:
-    if minutes is None:
-        return "00:00"
-    try:
-        total_minutes = int(round(minutes))
-    except Exception:
-        return "00:00"
-    hours, mins = divmod(total_minutes, 60)
-    return f"{hours:02d}:{mins:02d}"
-
-
-# -------------------------------------------------------------------
-# Streamlit app
-# -------------------------------------------------------------------
+# ============================================================
+# App
+# ============================================================
 
 def main():
     st.set_page_config(page_title="Course Load Estimator", layout="wide")
     st.title("📚 Course Load Estimator")
 
-    if "items" not in st.session_state:
-        st.session_state["items"] = []
-    if "results" not in st.session_state:
-        st.session_state["results"] = []
-    if "pending_videos" not in st.session_state:
-        st.session_state["pending_videos"] = {}
+    # session state
+    st.session_state.setdefault("items", [])
+    st.session_state.setdefault("results", [])
+    st.session_state.setdefault("pending_videos", {})
 
+    # Sidebar config
     st.sidebar.header("Configuration")
     course_id = st.sidebar.text_input("Canvas Course ID", value="")
     level = st.sidebar.selectbox("Student Level", ["Undergraduate", "Graduate"])
@@ -510,7 +550,20 @@ def main():
     use_llm = st.sidebar.checkbox("Use Azure OpenAI for difficulty & DO time", value=True)
     debug_breakdown = st.sidebar.checkbox("Debug read-time breakdown", value=False)
 
-    # KPIs at top (HH:MM)
+    # Status
+    st.sidebar.markdown("### Canvas status")
+    if not (CANVAS_BASE and CANVAS_TOKEN):
+        st.sidebar.error("Canvas secrets missing or incomplete.")
+    else:
+        st.sidebar.success("Canvas configured.")
+
+    st.sidebar.markdown("### Azure OpenAI status")
+    if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
+        st.sidebar.warning("Azure OpenAI secrets missing or incomplete.")
+    else:
+        st.sidebar.success("Azure OpenAI configured.")
+
+    # KPIs (hh:mm) from current results
     if st.session_state.get("results"):
         df_all = pd.DataFrame(st.session_state["results"])
         total_read = df_all.get("read_min", pd.Series(dtype=float)).sum()
@@ -524,25 +577,14 @@ def main():
         c3.metric("Total Do (hh:mm)", minutes_to_hhmm(total_do))
         c4.metric("Total Workload (hh:mm)", minutes_to_hhmm(total_total))
 
-    st.sidebar.markdown("### Azure OpenAI status")
-    if not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
-        st.sidebar.warning("Azure OpenAI secrets missing or incomplete.")
-    else:
-        st.sidebar.success("Azure OpenAI configured.")
-
-    st.sidebar.markdown("### Canvas status")
-    if not (CANVAS_BASE and CANVAS_TOKEN):
-        st.sidebar.error("Canvas secrets missing or incomplete.")
-    else:
-        st.sidebar.success("Canvas configured.")
-
     st.markdown(
         """
-This tool estimates workload per module:
-
-- **READ** – Canvas pages + linked Canvas documents  
-- **WATCH** – embedded/linked videos (manual durations)  
-- **DO** – assignments/discussions/quizzes
+This estimator calculates:
+- **READ**: Canvas page text + Canvas-hosted linked documents (PDF/DOCX/etc).  
+  - Word counts extracted locally.
+  - Difficulty factor from Azure OpenAI using **only the first 5,000 characters**.
+- **WATCH**: videos detected in content; you enter duration **per video**.
+- **DO**: assignments/discussions/quizzes (LLM or heuristic).
 """
     )
 
@@ -575,237 +617,306 @@ This tool estimates workload per module:
     if st.button("Process items for workload"):
         items = st.session_state.get("items", [])
         if not items:
-            st.warning("No items scanned yet. Run 'Scan Course' first.")
+            st.warning("No items scanned yet.")
         else:
             if use_llm and not (AZ_ENDPOINT and AZ_API_KEY and AZ_MODEL):
-                st.error("Azure OpenAI is not configured, or secrets missing.")
-            else:
-                results = []
-                pending_videos = []
-                debug_rows = []
+                st.error("Azure OpenAI not configured.")
+                return
 
-                for it in items:
-                    item_type = it["item_type"]
-                    title = it["title"]
-                    html_url = it["html_url"]
-                    item_key = it.get("item_key")
+            results = []
+            debug_rows: List[dict] = []
 
-                    read_min = 0.0
-                    watch_min = 0.0
-                    do_min = 0.0
-                    difficulty = default_difficulty()
+            for it in items:
+                item_type = it.get("item_type", "")
+                title = it.get("title", "")
+                html_url = it.get("html_url", "")
+                item_key = it.get("item_key", "")
 
-                    # Pages / Assignments / Discussions
-                    if item_type in ("Page", "Assignment", "Discussion"):
-                        try:
-                            if item_type == "Page":
-                                body = get_page_body(int(course_id), it.get("page_url"))
-                            elif item_type == "Assignment":
-                                a = get_assignment(int(course_id), it.get("content_id"))
-                                body = a.get("description", "") or ""
-                            else:
-                                d = get_discussion(int(course_id), it.get("content_id"))
-                                body = d.get("message", "") or ""
-                        except Exception:
-                            body = ""
+                read_min = 0.0
+                watch_min = 0.0
+                do_min = 0.0
 
-                        # videos
-                        vids = detect_videos_from_html(body)
-                        for idx, v in enumerate(vids, start=1):
-                            v_key = f"{item_key}::embed::{idx}"
-                            st.session_state["pending_videos"][v_key] = {
+                # -------- Pages / Assignments / Discussions --------
+                if item_type in ("Page", "Assignment", "Discussion"):
+                    try:
+                        if item_type == "Page":
+                            body_html = get_page_body(int(course_id), it.get("page_url"))
+                        elif item_type == "Assignment":
+                            a = get_assignment(int(course_id), it.get("content_id"))
+                            body_html = a.get("description", "") or ""
+                        else:
+                            d = get_discussion(int(course_id), it.get("content_id"))
+                            body_html = d.get("message", "") or ""
+                    except Exception:
+                        body_html = ""
+
+                    # detect videos (per-video entry later)
+                    vids = detect_videos_from_html(body_html)
+                    for idx, v in enumerate(vids, start=1):
+                        v_key = f"{item_key}::embed::{idx}"
+                        st.session_state["pending_videos"].setdefault(
+                            v_key,
+                            {
                                 "title": v.get("title", "Video"),
                                 "src": v.get("src", ""),
                                 "hhmmss": "00:00:00",
                                 "seconds": 0,
                                 "item_key": item_key,
-                            }
+                            },
+                        )
 
-                        # page text
-                        page_text = strip_html_to_text(body)
-                        page_words = words_from_text(page_text)
+                    # Page text -> local words
+                    page_text = strip_html_to_text(body_html)
+                    page_words = words_from_text(page_text)
 
-                        if page_words > 0:
-                            if use_llm:
-                                try:
-                                    difficulty = azure_llm_difficulty(
-                                        page_text, AZ_ENDPOINT, AZ_MODEL, AZ_API_KEY, AZ_MAX_CHARS, AZ_API_VERSION
-                                    )
-                                except Exception:
-                                    difficulty = default_difficulty()
-                            page_read = reading_minutes(page_words, base_wpm, difficulty)
-                            read_min += page_read
+                    if page_words > 0:
+                        if use_llm:
+                            diff = azure_llm_difficulty_sample(page_text[:LLM_SAMPLE_CHARS])
+                            wpm_factor = diff.get("wpm_factor", 1.0)
+                        else:
+                            diff = default_difficulty()
+                            wpm_factor = 1.0
 
+                        page_minutes = reading_minutes_from_words(page_words, base_wpm, wpm_factor)
+                        read_min += page_minutes
+
+                        if debug_breakdown:
+                            debug_rows.append({
+                                "item": title,
+                                "component": "page_text",
+                                "name": "(page text)",
+                                "filename": "",
+                                "content_type": "text/html",
+                                "words": page_words,
+                                "minutes": page_minutes,
+                                "difficulty_label": diff.get("label"),
+                                "wpm_factor": wpm_factor,
+                                "note": "",
+                            })
+
+                    # Linked Canvas files (Canvas-only)
+                    file_ids = detect_canvas_file_ids_from_html(body_html)
+                    metas: List[dict] = []
+                    for fid in file_ids:
+                        try:
+                            metas.append(get_course_file(int(course_id), fid))
+                        except Exception:
+                            continue
+
+                    # Dedupe within this item; prefer PDF
+                    metas = dedupe_linked_files_by_stem(metas)
+
+                    for meta in metas:
+                        filename = meta.get("display_name") or meta.get("filename") or ""
+                        ct_hint = (meta.get("content-type") or meta.get("content_type") or "").lower()
+                        file_url = meta.get("url") or meta.get("download_url")
+
+                        if not file_url:
+                            continue
+
+                        text, pages_or_slides, detected_ct = extract_text_from_canvas_file(
+                            file_url=file_url,
+                            filename=filename,
+                            content_type_hint=ct_hint,
+                            max_bytes=MAX_FILE_BYTES,
+                        )
+                        ct = detected_ct or ct_hint
+                        ext = file_ext(filename)
+
+                        # PPTX: always heuristic (no words)
+                        if ext in ("pptx", "ppt") or "powerpoint" in (ct or ""):
+                            doc_minutes = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
+                            read_min += doc_minutes
                             if debug_breakdown:
                                 debug_rows.append({
                                     "item": title,
-                                    "component": "page_text",
-                                    "name": "(page text)",
-                                    "content_type": "text/html",
-                                    "size_bytes": None,
-                                    "words": page_words,
-                                    "minutes": page_read,
-                                    "note": ""
-                                })
-
-                        # linked Canvas docs
-                        file_ids = detect_canvas_file_ids_from_html(body)
-                        for fid in file_ids:
-                            try:
-                                meta = get_file_metadata(int(course_id), fid)
-                            except Exception:
-                                continue
-
-                            file_url = meta.get("url") or meta.get("download_url")
-                            size_bytes = meta.get("size")
-                            ct_hint = (meta.get("content-type") or meta.get("content_type") or "").lower()
-
-                            if not file_url:
-                                continue
-
-                            text, pages_or_slides, detected_ct = extract_file_text(file_url, ct_hint, MAX_FILE_BYTES)
-                            ct = detected_ct or ct_hint
-
-                            f_words = words_from_text(text)
-
-                            # Sanity: treat absurd extraction as junk and fall back
-                            minutes_added = 0.0
-                            note = ""
-                            if f_words > 0:
-                                if f_words > MAX_REASONABLE_WORDS:
-                                    note = f"sanity-fallback: words>{MAX_REASONABLE_WORDS}"
-                                    minutes_added = estimate_minutes_from_pages_or_unknown(pages_or_slides, ct, size_bytes)
-                                else:
-                                    if use_llm:
-                                        try:
-                                            f_diff = azure_llm_difficulty(
-                                                text, AZ_ENDPOINT, AZ_MODEL, AZ_API_KEY, AZ_MAX_CHARS, AZ_API_VERSION
-                                            )
-                                        except Exception:
-                                            f_diff = default_difficulty()
-                                    else:
-                                        f_diff = default_difficulty()
-
-                                    minutes_added = reading_minutes(f_words, base_wpm, f_diff)
-                                    if minutes_added > MAX_REASONABLE_MINUTES_PER_FILE:
-                                        note = f"sanity-fallback: minutes>{MAX_REASONABLE_MINUTES_PER_FILE}"
-                                        minutes_added = estimate_minutes_from_pages_or_unknown(pages_or_slides, ct, size_bytes)
-                            else:
-                                minutes_added = estimate_minutes_from_pages_or_unknown(pages_or_slides, ct, size_bytes)
-                                note = "no-text-fallback"
-
-                            read_min += minutes_added
-
-                            if debug_breakdown:
-                                debug_rows.append({
-                                    "item": title,
-                                    "component": "linked_file",
-                                    "name": meta.get("display_name") or meta.get("filename") or f"file:{fid}",
+                                    "component": "linked_doc",
+                                    "name": meta.get("display_name") or meta.get("filename") or f"file:{meta.get('id')}",
+                                    "filename": filename,
                                     "content_type": ct,
-                                    "size_bytes": size_bytes,
-                                    "words": f_words,
-                                    "minutes": minutes_added,
-                                    "note": note
+                                    "words": 0,
+                                    "minutes": doc_minutes,
+                                    "difficulty_label": None,
+                                    "wpm_factor": None,
+                                    "note": f"pptx/slides heuristic ({pages_or_slides} slides)",
                                 })
+                            continue
 
-                        # DO time
-                        if item_type in ("Assignment", "Discussion"):
-                            if page_words > 0:
-                                if use_llm:
-                                    task = azure_llm_task_time(
-                                        page_text, item_type, level, AZ_ENDPOINT, AZ_MODEL, AZ_API_KEY, AZ_MAX_CHARS, AZ_API_VERSION
-                                    )
-                                    do_min = float(task.get("do_minutes", 0.0))
-                                    difficulty["work_rationale"] = task.get("rationale", "")
-                                else:
-                                    do_min = heuristic_task_time(page_words, item_type, level)
+                        # Text-bearing doc -> local words
+                        doc_words = words_from_text(text)
 
-                    # File module items
-                    elif item_type == "File":
-                        cd = it.get("content_details") or {}
-                        file_url = cd.get("url")
-                        ct_hint = (cd.get("content_type", "") or "").lower()
-                        size_bytes = None  # content_details doesn't always include size
+                        # Sanity: if extraction went nuts or doc is empty, fallback
+                        if doc_words <= 0:
+                            doc_minutes = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
+                            read_min += doc_minutes
+                            if debug_breakdown:
+                                debug_rows.append({
+                                    "item": title,
+                                    "component": "linked_doc",
+                                    "name": meta.get("display_name") or meta.get("filename") or f"file:{meta.get('id')}",
+                                    "filename": filename,
+                                    "content_type": ct,
+                                    "words": doc_words,
+                                    "minutes": doc_minutes,
+                                    "difficulty_label": None,
+                                    "wpm_factor": None,
+                                    "note": "no-text fallback",
+                                })
+                            continue
 
-                        if file_url:
-                            text, pages_or_slides, detected_ct = extract_file_text(file_url, ct_hint, MAX_FILE_BYTES)
-                            ct = detected_ct or ct_hint
+                        if doc_words > MAX_REASONABLE_WORDS_PER_DOC:
+                            doc_minutes = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
+                            read_min += doc_minutes
+                            if debug_breakdown:
+                                debug_rows.append({
+                                    "item": title,
+                                    "component": "linked_doc",
+                                    "name": meta.get("display_name") or meta.get("filename") or f"file:{meta.get('id')}",
+                                    "filename": filename,
+                                    "content_type": ct,
+                                    "words": doc_words,
+                                    "minutes": doc_minutes,
+                                    "difficulty_label": None,
+                                    "wpm_factor": None,
+                                    "note": f"sanity fallback (words>{MAX_REASONABLE_WORDS_PER_DOC})",
+                                })
+                            continue
+
+                        # Difficulty from SAMPLE ONLY (first 5000 chars)
+                        if use_llm:
+                            diff = azure_llm_difficulty_sample((text or "")[:LLM_SAMPLE_CHARS])
+                            wpm_factor = diff.get("wpm_factor", 1.0)
+                        else:
+                            diff = default_difficulty()
+                            wpm_factor = 1.0
+
+                        doc_minutes = reading_minutes_from_words(doc_words, base_wpm, wpm_factor)
+
+                        if doc_minutes > MAX_REASONABLE_MINUTES_PER_DOC:
+                            doc_minutes = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
+                            note = f"sanity fallback (minutes>{MAX_REASONABLE_MINUTES_PER_DOC})"
+                        else:
+                            note = ""
+
+                        read_min += doc_minutes
+
+                        if debug_breakdown:
+                            debug_rows.append({
+                                "item": title,
+                                "component": "linked_doc",
+                                "name": meta.get("display_name") or meta.get("filename") or f"file:{meta.get('id')}",
+                                "filename": filename,
+                                "content_type": ct,
+                                "words": doc_words,
+                                "minutes": doc_minutes,
+                                "difficulty_label": diff.get("label"),
+                                "wpm_factor": wpm_factor,
+                                "note": note,
+                            })
+
+                    # DO time for assignments/discussions
+                    if item_type in ("Assignment", "Discussion"):
+                        if use_llm:
+                            do_min = azure_llm_task_time(page_text, item_type, level)
+                            # if LLM fails returns 0; fall back
+                            if do_min <= 0 and page_words > 0:
+                                do_min = heuristic_task_time(page_words, item_type, level)
+                        else:
+                            do_min = heuristic_task_time(page_words, item_type, level)
+
+                # -------- File module items (Canvas file items) --------
+                elif item_type == "File":
+                    cd = it.get("content_details") or {}
+                    file_url = cd.get("url")
+                    filename = cd.get("display_name") or cd.get("filename") or title or ""
+                    ct_hint = (cd.get("content_type") or "").lower()
+
+                    if file_url:
+                        text, pages_or_slides, detected_ct = extract_text_from_canvas_file(
+                            file_url=file_url,
+                            filename=filename,
+                            content_type_hint=ct_hint,
+                            max_bytes=MAX_FILE_BYTES,
+                        )
+                        ct = detected_ct or ct_hint
+                        ext = file_ext(filename)
+
+                        if ext in ("pptx", "ppt") or "powerpoint" in (ct or ""):
+                            read_min = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
+                        else:
                             w = words_from_text(text)
-
-                            if w > 0 and w <= MAX_REASONABLE_WORDS:
-                                if use_llm:
-                                    try:
-                                        difficulty = azure_llm_difficulty(
-                                            text, AZ_ENDPOINT, AZ_MODEL, AZ_API_KEY, AZ_MAX_CHARS, AZ_API_VERSION
-                                        )
-                                    except Exception:
-                                        difficulty = default_difficulty()
-                                minutes_added = reading_minutes(w, base_wpm, difficulty)
-                                if minutes_added > MAX_REASONABLE_MINUTES_PER_FILE:
-                                    minutes_added = estimate_minutes_from_pages_or_unknown(pages_or_slides, ct, size_bytes)
-                                read_min = minutes_added
+                            if w <= 0 or w > MAX_REASONABLE_WORDS_PER_DOC:
+                                read_min = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
                             else:
-                                read_min = estimate_minutes_from_pages_or_unknown(pages_or_slides, ct, size_bytes)
+                                if use_llm:
+                                    diff = azure_llm_difficulty_sample((text or "")[:LLM_SAMPLE_CHARS])
+                                    wpm_factor = diff.get("wpm_factor", 1.0)
+                                else:
+                                    wpm_factor = 1.0
+                                read_min = reading_minutes_from_words(w, base_wpm, wpm_factor)
+                                if read_min > MAX_REASONABLE_MINUTES_PER_DOC:
+                                    read_min = minutes_fallback_for_nontext(pages_or_slides, filename, ct)
 
-                    # Quiz
-                    elif item_type == "Quiz":
-                        q_meta = it.get("content_details") or {}
-                        quiz_id = it.get("content_id")
-                        do_min = estimate_quiz_time(q_meta)
-                        if use_llm and quiz_id:
-                            try:
-                                quiz = get_quiz(int(course_id), quiz_id)
-                                q_text = strip_html_to_text(quiz.get("description", "") or "")
-                                meta_str = (
-                                    f"\n\n[Metadata: question_count="
-                                    f"{q_meta.get('question_count') or quiz.get('question_count')}, "
-                                    f"time_limit={q_meta.get('time_limit') or quiz.get('time_limit')} minutes]"
-                                )
-                                task = azure_llm_task_time(
-                                    q_text + meta_str, "Quiz", level, AZ_ENDPOINT, AZ_MODEL, AZ_API_KEY, AZ_MAX_CHARS, AZ_API_VERSION
-                                )
-                                do_min = float(task.get("do_minutes", do_min))
-                            except Exception:
-                                pass
+                # -------- Quiz --------
+                elif item_type == "Quiz":
+                    q_meta = it.get("content_details") or {}
+                    quiz_id = it.get("content_id")
+                    do_min = estimate_quiz_time(q_meta)
 
-                    # External link video items
-                    else:
-                        if any(dom in (html_url or "") for dom in ("youtube", "youtu.be", "vimeo", "echo360", "panopto", "kaltura")):
-                            v_key = f"{item_key}::external"
-                            st.session_state["pending_videos"][v_key] = {
+                    if use_llm and quiz_id:
+                        try:
+                            quiz = get_quiz(int(course_id), quiz_id)
+                            q_text = strip_html_to_text(quiz.get("description", "") or "")
+                            # Could sample too, but description is usually small
+                            do_llm = azure_llm_task_time(q_text, "Quiz", level)
+                            if do_llm > 0:
+                                do_min = do_llm
+                        except Exception:
+                            pass
+
+                # -------- External link video item --------
+                else:
+                    # Do not fetch anything external; only detect if it's a video and ask for manual duration
+                    if any(dom in (html_url or "") for dom in ("youtube", "youtu.be", "vimeo", "echo360", "panopto", "kaltura")):
+                        v_key = f"{item_key}::external"
+                        st.session_state["pending_videos"].setdefault(
+                            v_key,
+                            {
                                 "title": title or "External Video",
                                 "src": html_url,
                                 "hhmmss": "00:00:00",
                                 "seconds": 0,
                                 "item_key": item_key,
-                            }
+                            },
+                        )
 
-                    total = read_min + watch_min + do_min
-                    results.append(
-                        {
-                            "module": it["module_name"],
-                            "module_position": it.get("position", 0),
-                            "title": title,
-                            "type": item_type,
-                            "url": html_url,
-                            "item_key": item_key,
-                            "read_min": round(read_min, 2),
-                            "watch_min": round(watch_min, 2),
-                            "do_min": round(do_min, 2),
-                            "total_min": round(total, 2),
-                            "difficulty": difficulty,
-                        }
-                    )
+                total_min = float(read_min) + float(watch_min) + float(do_min)
 
-                st.session_state["results"] = results
-                st.success(f"Processed {len(results)} items. Videos detected: {len(st.session_state['pending_videos'])}")
+                results.append(
+                    {
+                        "module": it.get("module_name", ""),
+                        "module_position": it.get("module_position", 0),
+                        "title": title,
+                        "type": item_type,
+                        "url": html_url,
+                        "item_key": item_key,
+                        "read_min": round(read_min, 2),
+                        "watch_min": round(watch_min, 2),
+                        "do_min": round(do_min, 2),
+                        "total_min": round(total_min, 2),
+                    }
+                )
 
-                if debug_breakdown and debug_rows:
-                    with st.expander("Debug: read-time breakdown (page text + linked files)", expanded=False):
-                        dbg = pd.DataFrame(debug_rows)
-                        st.dataframe(dbg, use_container_width=True)
+            st.session_state["results"] = results
 
-    # 3) Video durations (keep per-video entry as requested)
+            st.success(f"Processed {len(results)} items. Videos detected: {len(st.session_state['pending_videos'])}")
+
+            if debug_breakdown and debug_rows:
+                with st.expander("Debug: read-time breakdown (Canvas page text + Canvas-hosted docs)", expanded=False):
+                    dbg = pd.DataFrame(debug_rows)
+                    st.dataframe(dbg, use_container_width=True)
+
+    # 3) Video durations
     st.header("3) Enter video durations (hh:mm:ss)")
 
     pending = st.session_state.get("pending_videos", {})
@@ -824,22 +935,23 @@ This tool estimates workload per module:
                     else:
                         meta["hhmmss"] = hhmmss
                         meta["seconds"] = sec
-                        st.success("Saved. Totals will update below when table is rendered.")
+                        st.success("Saved. Totals will update below.")
 
-        # Recompute watch_min per item
-        item_seconds = {}
+        # recompute watch minutes per item
+        item_seconds: Dict[str, int] = {}
         for meta in pending.values():
             ik = meta.get("item_key")
             if not ik:
                 continue
-            item_seconds[ik] = item_seconds.get(ik, 0) + meta.get("seconds", 0)
+            item_seconds[ik] = item_seconds.get(ik, 0) + int(meta.get("seconds", 0) or 0)
 
+        # apply to results
         for r in st.session_state.get("results", []):
             ik = r.get("item_key")
             sec_total = item_seconds.get(ik, 0)
             watch_min = sec_total / 60.0
             r["watch_min"] = round(watch_min, 2)
-            r["total_min"] = round(r["read_min"] + r["watch_min"] + r["do_min"], 2)
+            r["total_min"] = round(float(r.get("read_min", 0.0)) + float(r.get("watch_min", 0.0)) + float(r.get("do_min", 0.0)), 2)
 
     else:
         st.info("No videos detected yet. They’ll appear here after processing items.")
@@ -854,12 +966,12 @@ This tool estimates workload per module:
 
     df = pd.DataFrame(results)
 
-    # Ensure module_position exists
+    # Ensure module_position exists for older runs
     if "module_position" not in df.columns:
         module_order = {}
         for it in st.session_state.get("items", []):
             mn = it.get("module_name", "")
-            pos = it.get("position", 0)
+            pos = it.get("module_position", 0)
             if mn not in module_order or pos < module_order[mn]:
                 module_order[mn] = pos
         df["module_position"] = df["module"].map(lambda m: module_order.get(m, 0))
@@ -873,7 +985,7 @@ This tool estimates workload per module:
 
     grand_totals = {
         "module": "Grand Total",
-        "module_position": mod_summary["module_position"].max() + 1 if len(mod_summary) else 9999,
+        "module_position": (mod_summary["module_position"].max() + 1) if len(mod_summary) else 9999,
         "read_min": mod_summary["read_min"].sum(),
         "watch_min": mod_summary["watch_min"].sum(),
         "do_min": mod_summary["do_min"].sum(),
